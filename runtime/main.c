@@ -341,7 +341,7 @@ int main(int argc, char **argv) {
 #endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     if (build_romfs) return build_romfs_image(root);
-#ifdef __ORBIS__
+#ifdef SW_PS4_NO_GAME
     if (!gamelib_present(root)) { extern void ps4_no_game_test(void); ps4_no_game_test(); }  // (ps4/no_game.c)
 #endif
     if (scan) return scan_shaders(root);

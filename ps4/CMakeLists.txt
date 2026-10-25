@@ -118,6 +118,7 @@ if (SW_GENERATED)
     message(STATUS "game code: ${SW_GENERATED} (${GAMELIB_ID})")
 else ()
     target_sources(savagewind PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/no_game.c)
+    target_compile_definitions(savagewind PRIVATE SW_PS4_NO_GAME)  # (runtime/main.c runs its console test)
     message(STATUS "game code: none (a runtime-only eboot)")
 endif ()
 
