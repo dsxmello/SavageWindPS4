@@ -130,6 +130,27 @@ void plat_commit(uint64_t addr, uint64_t size) {
 
 uint64_t plat_guest_backed_bytes(void) { return atomic_load(&g_backed); }
 
+// Host stacks of guest threads (runtime/kernel.c thread_start): direct memory mapped anywhere, CPU only, all of it
+// backed (no alternate signal stack here: a fault on a thread's own stack couldn't be handled). Never freed: the
+// game's threads live as long as the process.
+static _Atomic uint64_t g_stack_bytes;
+void *plat_alloc_stack(size_t size) {
+    size = (size + CHUNK - 1) & ~(CHUNK - 1);
+    off_t phys = 0;
+    if (sceKernelAllocateDirectMemory(0, (off_t)sceKernelGetDirectMemorySize(), size, CHUNK, SCE_KERNEL_WB_ONION,
+                                      &phys) != 0)
+        return NULL;
+    void *p = NULL;
+    if (sceKernelMapDirectMemory(&p, size, SCE_KERNEL_PROT_CPU_RW, 0, phys, CHUNK) != 0) {
+        sceKernelReleaseDirectMemory(phys, size);
+        return NULL;
+    }
+    uint64_t total = atomic_fetch_add(&g_stack_bytes, size) + size;
+    fprintf(stderr, "[plat] host stack %llu MB at %p (%llu MB of stacks)\n", (unsigned long long)(size >> 20), p,
+            (unsigned long long)(total >> 20));
+    return p;
+}
+
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
     int p = prot == PLAT_PROT_NONE ? 0 : prot == PLAT_PROT_READ ? SCE_KERNEL_PROT_CPU_READ : SCE_KERNEL_PROT_CPU_RW;
     if (p) p |= SCE_KERNEL_PROT_GPU_RW;
@@ -338,7 +359,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     rt_fault_report(what, fa, pc, lr);
 }
 
-// (no alternate signal stack: not verified on the console; host stacks are 32 MB, a fault on one's guard page ends
+// (no alternate signal stack: not verified on the console; host stacks are 16 MB of direct memory, a fault on one's guard page ends
 // the title without a report)
 void plat_crash_handler_install(void) {
     static bool installed;  // (process-wide on the PS4, unlike the per-thread signal stack elsewhere)

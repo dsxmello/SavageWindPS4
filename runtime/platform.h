@@ -38,6 +38,9 @@ void plat_thread_realtime(uint64_t period_ns);  // periodic timing thread (vsync
 void plat_init(void);                                // first thing in main()
 bool plat_exe_path(char *buf, size_t size);
 void plat_exec(char *const argv[]);  // replace the process (NULL = same command line); returns only on failure
+#ifdef __ORBIS__
+void *plat_alloc_stack(size_t size);  // a host thread's stack (its lowest address), backed; NULL when out of memory
+#endif
 #if defined(_WIN32) || defined(__linux__) || defined(__ORBIS__)
 void plat_terminate(void);  // end the process now, skipping DLL teardown (exit status 0)
 #endif

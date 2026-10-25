@@ -429,10 +429,10 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
 }
 
 // Host stack of each guest thread: guest recursion runs on it. SAVAGEWIND_HOST_STACK_MB overrides the size, to find
-// what the game really needs before a console with less address space and memory (the PS4: 32 MB by default).
+// what the game really needs before a console with less address space and memory (the PS4: 16 MB by default).
 static size_t host_stack_size(void) {
 #ifdef __ORBIS__
-    size_t mb = 32;
+    size_t mb = 16;  // (direct memory, all of it backed: plat_alloc_stack; BOTW 1.8.2 starts ~43 threads)
 #else
     size_t mb = 256;
 #endif
@@ -444,9 +444,18 @@ static size_t host_stack_size(void) {
 static void thread_start(KThread *t) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+#ifdef __ORBIS__
+    // (PS4: a plain pthread stack comes from the process's small flexible memory - the game's 6th thread found none
+    // left and never ran; plat_alloc_stack takes it from direct memory)
+    void *stack = plat_alloc_stack(host_stack_size());
+    if (!stack) FATAL("no memory for the host stack of thread %llu (%zu MB)\n", (unsigned long long)t->id, host_stack_size() >> 20);
+    pthread_attr_setstack(&attr, stack, host_stack_size());
+#else
     pthread_attr_setstacksize(&attr, host_stack_size());
+#endif
     t->started = true;
-    pthread_create(&t->host, &attr, thread_main, t);
+    int r = pthread_create(&t->host, &attr, thread_main, t);
+    if (r) FATAL("cannot start the host thread of guest thread %llu (error %d)\n", (unsigned long long)t->id, r);
     pthread_attr_destroy(&attr);
 }
 

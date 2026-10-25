@@ -85,7 +85,8 @@ Your game files go there too, sent by FTP (GoldHEN's FTP server, port 2121):
   - The game code is built for the Jaguar (`-march=btver2`: AVX, no AVX2 / FMA) from the portable C SIMD mode.
   - FMADD and the like go through `runtime/simd_softfma.h` (the PC's compatible target uses it too): exact, but slow.
   - On a PC, `make GENARCH=-march=btver2 B=build/btver2` builds that variant to test it.
-- **Host stacks:** 32 MB per guest thread instead of 256 MB. `SAVAGEWIND_HOST_STACK_MB` sets it on the PC, to find what
+- **Host stacks:** 16 MB per guest thread instead of 256 MB, from direct memory (`plat_alloc_stack`): plain pthread
+  stacks come from the process's small flexible memory, which ran out at the game's 6th thread. `SAVAGEWIND_HOST_STACK_MB` sets it on the PC, to find what
   the game needs.
 - **Paths:** the kernel refuses relative paths, so `ps4/ps4_paths.c` wraps the path calls (`--wrap`).
 - **No start screen and no game-code build on the console.** Both happen on the PC.
