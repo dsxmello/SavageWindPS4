@@ -145,6 +145,34 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     return n;
 }
 
+#ifdef __ORBIS__
+// The PS4 can't load libraries: the game code is linked into the eboot (ps4/CMakeLists.txt). A runtime-only build
+// links ps4/no_game.c instead, whose swgame_tables returns NULL (a weak undefined symbol would be an import the
+// console can't resolve).
+const GameLibTables *swgame_tables(void);
+
+bool gamelib_present(const char *game_dir) { (void)game_dir; return swgame_tables() != NULL; }
+
+bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
+    (void)game_dir;
+    const GameLibTables *t = g_tables ? NULL : swgame_tables();
+    if (t) {
+        if (t->abi == GAMELIB_ABI && t->id && !strcmp(t->id, gamelib_id())) g_tables = t;
+        else snprintf(g_error, sizeof g_error, "the game code linked in was built for another version");
+        if (g_tables && !take_sites(g_tables)) g_tables = NULL;
+        if (g_tables) LOG("[gamelib] linked in (game version %s, %u sites)\n", g_game_version, *g_tables->nsites);
+        if (g_tables)
+            for (uint32_t k = 0; k < *g_tables->nmodules; k++) {
+                const GameLibModule *m = &g_tables->modules[k];
+                LOG("[gamelib]   %-8s %llx-%llx %llu functions\n", m->name, (unsigned long long)m->base,
+                    (unsigned long long)(m->base + m->size), (unsigned long long)*m->count);
+            }
+    } else if (!g_tables)
+        snprintf(g_error, sizeof g_error, "this eboot was built without the game code (docs/ps4.md)");
+    if (!g_tables && why) snprintf(why, why_size, "%s", g_error);
+    return g_tables != NULL;
+}
+#else
 bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
     char c[3][1100];
@@ -208,5 +236,7 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     if (!g_tables && why) snprintf(why, why_size, "%s", g_error);
     return g_tables != NULL;
 }
+
+#endif
 
 const GameLibTables *gamelib_tables(void) { return g_tables; }

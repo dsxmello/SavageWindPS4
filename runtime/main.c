@@ -67,8 +67,13 @@ static void rtld_fini_main(Cpu *c) {
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
+static bool g_guest_reserve_failed;  // (PS4: reported once the log is open; no re-exec there)
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
     if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+#ifdef __ORBIS__
+    g_guest_reserve_failed = true;
+    return;
+#endif
     const char *tries = getenv("SAVAGEWIND_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
@@ -307,6 +312,8 @@ bool launcher_config_key_held(void);  // (macOS: Option held while the app opens
 
 int main(int argc, char **argv) {
     plat_init();
+    if (g_guest_reserve_failed)
+        FATAL("guest address range %llx-%llx could not be reserved\n", (unsigned long long)GUEST_LO, (unsigned long long)GUEST_HI);
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
 #else
@@ -329,8 +336,14 @@ int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (launcher_config_key_held()) config = true;  // (the Mac's "Savage Wind Configuration": Option held)
 #endif
+#ifdef __ORBIS__
+    skip_launcher = true;  // (no start screen: the game files and code are set up on the PC, docs/ps4.md)
+#endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     if (build_romfs) return build_romfs_image(root);
+#ifdef __ORBIS__
+    if (!gamelib_present(root)) { extern void ps4_no_game_test(void); ps4_no_game_test(); }  // (ps4/no_game.c)
+#endif
     if (scan) return scan_shaders(root);
 #ifndef __APPLE__
     if (precompile) return precompile_shaders(root);
@@ -351,6 +364,11 @@ int main(int argc, char **argv) {
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
+#ifdef __ORBIS__
+        (void)kind;
+        mode = LAUNCHER_NONE;
+#else
         mode = kind == RT_REBOOT_TITLE ? LAUNCHER_CONFIG : LAUNCHER_NONE;
+#endif
     }
 }

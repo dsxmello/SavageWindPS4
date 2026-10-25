@@ -287,7 +287,9 @@ int kernel_data_regions(uint64_t *addr, uint64_t *size, int max) {
 
 static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
     if (nregions == 1024) FATAL("too many regions\n");
+#ifndef __ORBIS__  // (PS4: physical memory for every page mapped; backed on first touch, file reads commit their own)
     plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the heap)
+#endif
     int i = nregions++;
     while (i > 0 && regions[i - 1].addr > addr) { regions[i] = regions[i - 1]; i--; }
     regions[i] = (Region){addr, size, type, perm};
@@ -402,10 +404,23 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     return t;
 }
 
+// Host stack of each guest thread: guest recursion runs on it. SAVAGEWIND_HOST_STACK_MB overrides the size, to find
+// what the game really needs before a console with less address space and memory (the PS4: 32 MB by default).
+static size_t host_stack_size(void) {
+#ifdef __ORBIS__
+    size_t mb = 32;
+#else
+    size_t mb = 256;
+#endif
+    const char *env = getenv("SAVAGEWIND_HOST_STACK_MB");
+    if (env && atoi(env) > 0) mb = (size_t)atoi(env);
+    return mb << 20;
+}
+
 static void thread_start(KThread *t) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256ull << 20);  // guest recursion runs on the host stack
+    pthread_attr_setstacksize(&attr, host_stack_size());
     t->started = true;
     pthread_create(&t->host, &attr, thread_main, t);
     pthread_attr_destroy(&attr);

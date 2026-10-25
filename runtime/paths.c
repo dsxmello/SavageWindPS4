@@ -93,6 +93,8 @@ void rt_paths_init(void) {
     else {
 #ifdef _WIN32
         snprintf(root, sizeof root, "%s", g_exe_dir);
+#elif defined(__ORBIS__)
+        snprintf(root, sizeof root, PS4_DATA_DIR);  // (/app0, the package, is read-only)
 #elif defined(__linux__)
         // (the AppImage is read-only): $XDG_DATA_HOME/savagewind, ~/.local/share/savagewind by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");

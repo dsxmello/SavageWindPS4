@@ -498,6 +498,7 @@ void fs_title_version_patch(void) {
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
 static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
+    plat_commit((uint64_t)(uintptr_t)dst, size);  // (the kernel writes there: backed first where that is lazy, PS4)
     if (!ov_n && !npatches) return pread(fd, dst, size, (off_t)off);
     uint64_t done = 0;
     while (done < size) {
@@ -629,6 +630,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *b = out_buf(req, 0);
         if ((uint64_t)size > b->size) size = (int64_t)b->size;
         kernel_watch_write("file read", b->addr, (uint64_t)size);
+        plat_commit(b->addr, (uint64_t)size);
         ssize_t n;
         if (f->patched) {  // (test warp)
             n = off >= 0 && (uint64_t)off < f->patched_size ? (ssize_t)((uint64_t)size < f->patched_size - (uint64_t)off ? (uint64_t)size : f->patched_size - (uint64_t)off) : 0;
@@ -648,6 +650,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *a = in_buf(req, 0);
         if (strstr(f->path, "savedata"))
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
+        plat_commit(a->addr, (uint64_t)size);  // (the kernel reads it: an untouched buffer has no memory yet, PS4)
         if (pwrite(f->fd, (void *)(uintptr_t)a->addr, (size_t)size, off) < 0) resp->result = errno_result();
         free(f->patched);  // (the game saved: its own data from now on)
         f->patched = NULL;

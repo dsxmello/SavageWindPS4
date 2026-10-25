@@ -54,8 +54,55 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
+#ifdef __ORBIS__
+static VkExtent2D g_display;  // the TV's mode (create_display_surface)
+#endif
+
+// The size the swapchain follows: the window's, or on the PS4 the display mode's (SDL's window there is a dummy
+// driver's, of no particular size; following it made a new swapchain every frame until VideoOut ran out of slots).
+static void window_pixels(int *w, int *h) {
+#ifdef __ORBIS__
+    *w = (int)g_display.width, *h = (int)g_display.height;
+#else
+    SDL_GetWindowSizeInPixels(window, w, h);
+#endif
+}
+
+#ifdef __ORBIS__
+// PS4: RADV (Mesa on GNM, linked into the eboot) is the only driver; its entry points come through volk. The window is
+// the TV: VK_KHR_display over VideoOut (Mesa's wsi_common_videoout.c), one 1920x1080 mode.
+PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
+static const char *const ps4_instance_ext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_DISPLAY_EXTENSION_NAME};
+#define SDL_Vulkan_GetInstanceExtensions(n) (*(n) = 2, ps4_instance_ext)
+
+static void create_display_surface(void) {
+    uint32_t n = 1;
+    VkPhysicalDevice pd;
+    vkEnumeratePhysicalDevices(g_vk.inst, &n, &pd);
+    if (!n) FATAL("no Vulkan device\n");
+    VkDisplayPropertiesKHR dp;
+    n = 1;
+    if (vkGetPhysicalDeviceDisplayPropertiesKHR(pd, &n, &dp) < 0 || !n) FATAL("no display\n");
+    VkDisplayModePropertiesKHR mp;
+    n = 1;
+    if (vkGetDisplayModePropertiesKHR(pd, dp.display, &n, &mp) < 0 || !n) FATAL("no display mode\n");
+    LOG("[vk] display %s: %ux%u @ %.2f Hz\n", dp.displayName ? dp.displayName : "?", mp.parameters.visibleRegion.width,
+        mp.parameters.visibleRegion.height, mp.parameters.refreshRate / 1000.0);
+    VkDisplaySurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR,
+                                        .displayMode = mp.displayMode, .planeIndex = 0,
+                                        .transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, .globalAlpha = 1,
+                                        .alphaMode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR,
+                                        .imageExtent = mp.parameters.visibleRegion};
+    VK_CHECK(vkCreateDisplayPlaneSurfaceKHR(g_vk.inst, &si, NULL, &g_vk.surface));
+    g_display = mp.parameters.visibleRegion;
+}
+#endif
+
 // SAVAGEWIND_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
 static void create_instance(void) {
+#ifdef __ORBIS__
+    volkInitializeCustom((PFN_vkGetInstanceProcAddr)vk_icdGetInstanceProcAddr);
+#endif
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
     const char *ext[24];
@@ -82,6 +129,9 @@ static void create_instance(void) {
         r = vkCreateInstance(&ci, NULL, &g_vk.inst);
     }
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
+#ifdef __ORBIS__
+    volkLoadInstanceOnly(g_vk.inst);
+#endif
     if (validate || ar) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
             (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCreateDebugUtilsMessengerEXT");
@@ -378,6 +428,9 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+#ifdef __ORBIS__
+    volkLoadDevice(g_vk.dev);
+#endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     g_vk.present_queue = g_vk.queue;
     if (qi.queueCount == 2) vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 1, &g_vk.present_queue);
@@ -721,7 +774,7 @@ static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
     int w, h;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    window_pixels(&w, &h);
     VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : (VkExtent2D){(uint32_t)w, (uint32_t)h};
     if (!ext.width || !ext.height) return;  // minimised
     uint32_t nf = 0;
@@ -1027,7 +1080,7 @@ static Frame cur_frame;
 bool vk_frame_begin(const float clear[4]) {
     cur_frame.ok = false;
     int w, h;
-    SDL_GetWindowSizeInPixels(window, &w, &h);
+    window_pixels(&w, &h);
     // minimised (Windows keeps the window's size then, but its surface is 0 x 0: every acquire was out of date)
     if (!w || !h || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) return false;
     uint64_t tp = SDL_GetTicksNS();
@@ -1129,6 +1182,9 @@ void vk_frame_end(const char *shot_path) {
     if (!present_image(img, done_sem[img])) recreate_swapchain();
     g_present_split[4] += SDL_GetTicksNS() - ts;
     cur_frame.ok = false;
+#ifdef __ORBIS__
+    { extern void plat_first_frame(void); plat_first_frame(); }  // (the console's boot splash stays until now)
+#endif
     if (shot_path) {
         vk_wait_seq(seq);
         uint32_t w = g_vk.sc_extent.width, h = g_vk.sc_extent.height;
@@ -1447,7 +1503,7 @@ static void quick_exit_handler(void) {
     if (trace) LOG("[vk] exit: terminating\n");
     fflush(stdout);
     fflush(stderr);
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__ORBIS__)
     plat_terminate();
 #endif
 }
@@ -1456,6 +1512,9 @@ void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef __ORBIS__
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");  // (a window for SDL's event and input code; the picture is VideoOut's)
+#endif
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     // Video > Window size (runtime/window_size.c: pixels; SDL's window size is pixels / the display's pixel density)
@@ -1465,7 +1524,12 @@ void ui_window_init(void) {
     float density = dm && dm->pixel_density > 0 ? dm->pixel_density : 1;
     int win_w = (int)lroundf(ws.w / density), win_h = (int)lroundf(ws.h / density);
     if (getenv("SAVAGEWIND_WINDOW")) sscanf(getenv("SAVAGEWIND_WINDOW"), "%dx%d", &win_w, &win_h);
+#ifdef __ORBIS__
+    win_w = 1920, win_h = 1080;  // (the display mode: the swapchain follows the window's size)
+    SDL_WindowFlags wflags = 0;
+#else
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#endif
     if (getenv("SAVAGEWIND_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
     window = SDL_CreateWindow("Savage Wind", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
@@ -1473,7 +1537,11 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     winsize_apply(window);
     create_instance();
+#ifdef __ORBIS__
+    create_display_surface();
+#else
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+#endif
     pick_device();
     create_device();
     create_swapchain();
@@ -1514,6 +1582,9 @@ int ui_run(void) {
     atomic_store(&ui_ready, true);
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
+#ifdef __ORBIS__
+        { extern void ps4_pad_poll(void); ps4_pad_poll(); }  // (ps4/ps4_pad.c: the pads as SDL gamepads)
+#endif
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
