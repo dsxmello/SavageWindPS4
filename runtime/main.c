@@ -119,7 +119,7 @@ void reboot_test_frame(uint64_t frame) {
 #ifdef __APPLE__
 extern const ResetFn __start_resets[] __asm__("section$start$__DATA$__rt_reset");
 extern const ResetFn __stop_resets[] __asm__("section$end$__DATA$__rt_reset");
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__ORBIS__)  // (ELF)
 extern const ResetFn __start_resets[], __stop_resets[];  // (ELF: defined by the linker)
 #else
 // PE/COFF: .rst$a < .rst$m (entries, hle.h) < .rst$z (the linker sorts by the text after '$')
