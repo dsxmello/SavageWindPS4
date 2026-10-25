@@ -42,6 +42,9 @@ struct KThread {
     int core_held;
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
+    // (hang dumps, kernel_dump_threads) the syscall it is in (-1: none) and the guest lr at it
+    volatile int svc_now;
+    volatile uint64_t svc_lr;
 };
 
 typedef struct KSharedMem {
@@ -81,4 +84,6 @@ void kernel_sample_host_thread(void);  // (profiling) the calling host thread is
 // A better thread waits for t's core: t lets it have it (dispatch.c, at indirect calls; g_core_best_wait: per core)
 extern volatile int g_core_best_wait[4];
 void kernel_preempt(KThread *t);
+// (debug) every guest thread and core to the log: what each waits in. Lock-free reads: for a hang, not exact.
+void kernel_dump_threads(const char *why);
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize

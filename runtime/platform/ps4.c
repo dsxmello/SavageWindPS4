@@ -189,10 +189,36 @@ static void load_system_modules(void) {
     }
 }
 
+// Hang watchdog: the log stays the same size for 10 s -> every guest thread's state to it (kernel_dump_threads), at
+// most 5 times, 30 s apart. The console has no debugger to attach; this shows what each thread waits in.
+void kernel_dump_threads(const char *why);
+static void *hang_watch(void *arg) {
+    (void)arg;
+    off_t last = -1;
+    int still = 0, dumps = 0, wait = 10;
+    for (;;) {
+        sleep(1);
+        struct stat st;
+        if (fstat(2, &st) != 0) continue;
+        if (st.st_size != last) { last = st.st_size; still = 0; wait = 10; continue; }
+        if (++still < wait || dumps >= 5) continue;
+        char why[64];
+        snprintf(why, sizeof why, "no log for %d s (dump %d)", still, ++dumps);
+        kernel_dump_threads(why);
+        fstat(2, &st);
+        last = st.st_size;
+        still = 0;
+        wait = 30;
+    }
+    return NULL;
+}
+
 void plat_init(void) {
     log_to_file();
     load_system_modules();
     fprintf(stderr, "[plat] PS4: %llu MB of direct memory\n", (unsigned long long)(sceKernelGetDirectMemorySize() >> 20));
+    pthread_t t;
+    if (pthread_create(&t, NULL, hang_watch, NULL) == 0) pthread_detach(t);
 }
 
 // The console's boot splash stays up until the first frame (runtime/nvn/vulkan: first present).

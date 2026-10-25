@@ -351,6 +351,29 @@ void kernel_sample_host_thread(void) {
     if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
     pthread_mutex_unlock(&g_klock);
 }
+void kernel_dump_threads(const char *why) {
+    static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
+    LOG("[hang] %s: threads (svc = the syscall it is in, core = held / wanted)\n", why);
+    for (KThread *t = g_threads; t; t = t->anext) {
+        if (t->finished) continue;
+        char svc[8] = "-";
+        if (t->svc_now >= 0) snprintf(svc, sizeof svc, "%02x", t->svc_now);
+        LOG("[hang]   t%-3llu h%x prio %d (base %d) core %d held %d%s%s  svc %s lr %llx  wait %s %llx%s  "
+            "pc %llx x30 %llx sp %llx\n",
+            (unsigned long long)t->id, t->handle, t->prio, t->base_prio, t->core, t->core_held,
+            t->started ? "" : " (not started)", t->off_cores ? " off-cores" : "", svc, (unsigned long long)t->svc_lr,
+            kinds[t->wait_kind & 3], (unsigned long long)t->wait_addr, t->in_sync_wait ? " (sync)" : "",
+            (unsigned long long)t->cpu.pc, (unsigned long long)t->cpu.x[30], (unsigned long long)t->cpu.sp);
+    }
+    for (int i = 0; i < 4; i++) {
+        Core *k = &g_cores[i];
+        LOG("[hang]   core %d: owner t%lld, %d waiting:", i, k->owner ? (long long)k->owner->id : -1LL, k->nwaiting);
+        for (int j = 0; j < k->nwaiting && j < 64; j++)
+            LOG(" t%llu(p%d)", (unsigned long long)k->waiting[j]->id, k->waiting[j]->prio);
+        LOG("\n");
+    }
+}
+
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
     int n = 0;
     pthread_mutex_lock(&g_klock);
@@ -383,6 +406,7 @@ static void *thread_main(void *arg) {
 
 static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int prio, int core) {
     KThread *t = calloc(1, sizeof *t);
+    t->svc_now = -1;
     pthread_cond_init(&t->cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
@@ -812,7 +836,15 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
 }
 
+static void svc_impl_traced(Cpu *c, uint32_t imm, uint64_t pc);
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
+    KThread *me = t_cur;
+    if (me) { me->svc_lr = c->x[30]; me->svc_now = (int)imm; }
+    svc_impl_traced(c, imm, pc);
+    if (me) me->svc_now = -1;
+}
+
+static void svc_impl_traced(Cpu *c, uint32_t imm, uint64_t pc) {
     if (prof_svc < 0) prof_svc = ENV("SAVAGEWIND_PROF_SVC") != NULL;
     if (prof_svc && imm < 0x80) {
         uint64_t a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], a3 = c->x[3], lr = c->x[30];
