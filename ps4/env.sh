@@ -9,6 +9,7 @@ export PS4_VK_ROOT="${PS4_VK_ROOT:-$HOME/Projetos/triaevum/triaevum-ps4-vk}"
 [ -f "$PS4_VK_ROOT/tools/env.sh" ] || { echo "PS4_VK_ROOT: no toolchain at $PS4_VK_ROOT" >&2; return 1; }
 source "$PS4_VK_ROOT/tools/env.sh"  # PSB, PS4_SYSROOT, OPENORBIS, DOLPHINPS4, PATH, LD_LIBRARY_PATH
 export SW_PS4_BUILD="${SW_PS4_BUILD:-$HOME/savagewind-ps4-build}"
-export PS4_MESA_BUILD="$PSB/build/mesa"
-export PS4_MESA_SRC="$PSB/src/mesa"
+# Mesa: Savage Wind's own copy and build (ps4/build-mesa.sh: TriAevum's tree + ps4/mesa-savagewind.patch)
+export PS4_MESA_SRC="$SW_PS4_BUILD/src/mesa"
+export PS4_MESA_BUILD="$SW_PS4_BUILD/build/mesa"
 export PS4_TOOLCHAIN_FILE="$DOLPHINPS4/toolchain/ps4-love-modern.cmake"

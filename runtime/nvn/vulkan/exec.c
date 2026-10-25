@@ -3183,6 +3183,9 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (copy || addr < HEAP_BASE) return false;
     if (!gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
+#ifdef __ORBIS__
+    plat_commit(addr, size);  // (PS4: the heap gets memory on first touch; a GPU read of a chunk without any faults the GPU)
+#endif
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;

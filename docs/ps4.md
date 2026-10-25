@@ -17,7 +17,7 @@ console test instead of the game (see "First test").
 - The toolchain from TriAevum PS4 (`PS4_VK_ROOT`, default `~/Projetos/triaevum/triaevum-ps4-vk`):
   - the PacBrew OpenOrbis SDK
   - the libc++ 21 / glslang sysroot
-  - the Mesa 26.0.8 RADV build
+  - the Mesa 26.0.8 RADV tree (copied and built here with Savage Wind's patch: `ps4/build-mesa.sh`)
   - the patched DolphinPS4 tree
 
   These are used read-only.
@@ -97,7 +97,9 @@ Your game files go there too, sent by FTP (GoldHEN's FTP server, port 2121):
 
 - Vertex formats R8 / R16 USCALED / SSCALED deform models on RADV/GFX7 (found by TriAevum PS4). They may need a CPU
   conversion here too.
-- The guest heap is not imported for the GPU yet: `ac_ps4_drm.c` has no userptr. Shader global memory reads return zero
-  and vertex data is copied.
+- The guest heap is imported for the GPU (shader global memory, vertices read in place) through Savage Wind's own
+  Mesa build (`ps4/build-mesa.sh`, `ps4/mesa-savagewind.patch`): user memory buffers in DolphinPS4's winsys, at their
+  own address. The heap is backed on first touch, so a GPU access to a chunk the CPU never touched faults the GPU;
+  vertex and index ranges are backed before they are used, shader global memory isn't.
 - Pipelines compile on the console's CPU (ACO): the first sight of an effect stutters until the cache under
   `/data/savagewind/cache` has it.
