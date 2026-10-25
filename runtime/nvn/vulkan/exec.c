@@ -796,6 +796,7 @@ bool renderer_texture_frame_fresh(NvnTexture *t);
 void renderer_texture_mark_presented(NvnTexture *t);
 uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
+static void debug_log_raw(TexBackend *b, const char *path);  // (debug frames)
 static float pass_sx = 1, pass_sy = 1;
 static bool pass_out;  // the pass draws into the game's final image (RS_OUT: the HUD and menus draw there)
 static bool hud_clip;  // the draw in progress is a 16:9 layout's pane wholly off a 16:9 screen: not drawn (hud_patch)
@@ -1082,6 +1083,7 @@ static void vk_end_pass_at(int line) {
         if (main_only < 0) main_only = getenv("SAVAGEWIND_DEBUG_MAIN_ONLY") != NULL;
         if (debug_pass_no - 1 < from || debug_pass_no - 1 > to) return;
         renderer_save_texture_tex(pass_dbg[0]->backend, path);
+        debug_log_raw(pass_dbg[0]->backend, path);
         for (int i = 1; i < pass_dbg_n && !main_only; i++) {  // the other targets of a multi-target pass: pass_NNN_c<i>.png
             if (!pass_dbg[i] || !pass_dbg[i]->backend) continue;
             char p2[300];
@@ -5611,6 +5613,36 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 
 // (debug frames) each channel of a colour texture's level 0 as grey, <path> minus .png + _<channel>.png, and
 // _L<layer> before that for the layers of an array (up to 8).
+// (debug frames) a small target's texels as they are (its own format), as hex in the log: the PNGs clamp float
+// targets (exposure, average luminance) to 0..1 in 8 bits.
+static void debug_log_raw(TexBackend *b, const char *path) {
+    if (!b || !b->image || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (uint64_t)b->width * b->height > 256) return;
+    uint32_t bpt;
+    switch (b->format) {
+    case VK_FORMAT_R8_UNORM: bpt = 1; break;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R8G8_UNORM: bpt = 2; break;
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: bpt = 4; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: bpt = 8; break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: bpt = 16; break;
+    default: LOG("[pass] %s: format %d (raw dump: size unknown)\n", path, b->format); return;
+    }
+    uint64_t n = (uint64_t)b->width * b->height * bpt;
+    VkSpan out = vk_readback(n);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                           .imageExtent = {b->width, b->height, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    vk_full_barrier(cb);
+    renderer_flush();
+    char hex[256 * 16 * 2 + 1];
+    uint64_t k = 0;
+    for (uint64_t i = 0; i < n && k + 2 < sizeof hex; i++) k += (uint64_t)snprintf(hex + k, sizeof hex - k, "%02x", ((uint8_t *)out.ptr)[i]);
+    LOG("[pass] %s: format %d %ux%u raw %s\n", path, b->format, b->width, b->height, hex);
+}
+
 static void debug_save_channels(TexBackend *b, const char *path) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || b->base_type == VK_IMAGE_VIEW_TYPE_3D) return;
     VkFormat f = b->format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
