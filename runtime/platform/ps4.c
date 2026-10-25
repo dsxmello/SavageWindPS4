@@ -234,8 +234,32 @@ static void *hang_watch(void *arg) {
     return NULL;
 }
 
+// /data/savagewind/env.txt: KEY=VALUE lines (# comments) set as environment variables before anything reads them -
+// the PC's SAVAGEWIND_* test and debug switches, which the console has no other way to get. Dumps (screenshots,
+// SAVAGEWIND_DEBUG_FRAME's passes) go to build/ and build/frames/ under the data folder, as on the PC.
+static void env_from_file(void) {
+    FILE *f = fopen(PS4_DATA_DIR "/env.txt", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *e = line + strlen(line);
+        while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        char *k = line;
+        while (*k == ' ') k++;
+        char *eq = strchr(k, '=');
+        if (!*k || *k == '#' || !eq) continue;
+        *eq = 0;
+        setenv(k, eq + 1, 1);
+        fprintf(stderr, "[plat] env.txt: %s=%s\n", k, eq + 1);
+    }
+    fclose(f);
+    mkdir(PS4_DATA_DIR "/build", 0777);
+    mkdir(PS4_DATA_DIR "/build/frames", 0777);
+}
+
 void plat_init(void) {
     log_to_file();
+    env_from_file();
     load_system_modules();
     fprintf(stderr, "[plat] PS4: %llu MB of direct memory\n", (unsigned long long)(sceKernelGetDirectMemorySize() >> 20));
     pthread_t t;
