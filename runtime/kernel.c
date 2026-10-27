@@ -374,8 +374,21 @@ void kernel_log_core_waits(void) {
         if (t->finished || w * 200 < span) continue;  // (under 0.5%)
         n += snprintf(line + n, sizeof line - n, " h%x c%d %.1f%%", t->handle, t->core & 3, 100.0 * (double)w / (double)span);
     }
+    // [blocks]: the threads that spent over 5% of the time blocked
+    char bl[4096];
+    int m = snprintf(bl, sizeof bl, "[blocks] waits by length (<20us <50us <200us <1ms longer; spun; %% of the time):");
+    for (KThread *t = g_threads; t && m < (int)sizeof bl - 80; t = t->anext) {
+        uint64_t ns = t->blk_ns;
+        if (!t->finished && ns * 20 >= span)
+            m += snprintf(bl + m, sizeof bl - m, " h%x %u/%u/%u/%u/%u spun %u %.0f%%", t->handle, t->blk_hist[0], t->blk_hist[1],
+                          t->blk_hist[2], t->blk_hist[3], t->blk_hist[4], t->blk_spun, 100.0 * (double)ns / (double)span);
+        memset(t->blk_hist, 0, sizeof t->blk_hist);
+        t->blk_spun = 0;
+        t->blk_ns = 0;
+    }
     pthread_mutex_unlock(&g_klock);
     LOG("%s\n", line);
+    LOG("%s\n", bl);
 }
 
 void kernel_dump_threads(const char *why) {
@@ -610,6 +623,39 @@ static void waitlist_remove(KThread *t) {
 }
 
 // Block until wait_kind is cleared by a waker, timeout, or cancel. Caller holds g_klock.
+// A blocking wait first spins a little (its core let go) for the waker: most of BOTW's waits are short (the main thread
+// waits thousands of times a second for its workers' mutexes, condition variables and addresses), and going to sleep
+// and being woken by the host scheduler cost the PS4 tens of microseconds each. Returns whether the wait ended while
+// spinning. g_klock held on entry and return. SAVAGEWIND_SPIN_US=<us> (PS4 default 50, elsewhere 0: off).
+static bool block_spin(KThread *t, int64_t timeout_ns) {
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) {
+#ifdef __ORBIS__
+        spin_ns = 50000;
+#else
+        spin_ns = 0;
+#endif
+        if (getenv("SAVAGEWIND_SPIN_US")) spin_ns = atoll(getenv("SAVAGEWIND_SPIN_US")) * 1000;
+    }
+    int64_t limit = timeout_ns >= 0 && timeout_ns < spin_ns ? timeout_ns : spin_ns;
+    if (limit <= 0 || t->cancel) return false;
+    bool held = t->core_held >= 0;
+    pthread_mutex_unlock(&g_klock);
+    if (held) core_release(t);
+    uint64_t t0 = plat_now_ns();
+    bool woke = false;
+    for (int i = 0;; i++) {
+        if (__atomic_load_n(&t->wait_kind, __ATOMIC_ACQUIRE) == WAIT_NONE) { woke = true; break; }
+        if (g_rt_unwind || ((i & 15) == 15 && plat_now_ns() - t0 >= (uint64_t)limit)) break;
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+    if (held) core_acquire(t);
+    pthread_mutex_lock(&g_klock);
+    return woke;
+}
+
 static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
     struct timespec ts;
@@ -617,7 +663,9 @@ static uint32_t block_current(int64_t timeout_ns) {
     extern bool nvn_timeline(void);
     uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
+    uint64_t blk_t0 = plat_now_ns();
     waitlist_add(t);
+    if (block_spin(t, timeout_ns)) t->blk_spun++;
     while (t->wait_kind != WAIT_NONE) {
         if (g_rt_unwind) {  // reboot: give up the wait (the thread unwinds when its svc returns)
             t->wait_kind = WAIT_NONE;
@@ -646,6 +694,11 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
+    {
+        uint64_t d = plat_now_ns() - blk_t0;
+        t->blk_hist[d < 20000 ? 0 : d < 50000 ? 1 : d < 200000 ? 2 : d < 1000000 ? 3 : 4]++;
+        t->blk_ns += d;
+    }
     // (integers only: on the PS4 this runs on a stack generated code left unaligned, and printf's floats (SSE spills)
     // faulted there)
     if (tl_t0 && plat_now_ns() - tl_t0 > 200000) {

@@ -43,6 +43,10 @@ struct KThread {
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
     uint64_t core_wait_ns;  // (measuring) time spent waiting for its core's token (kernel_log_core_waits)
+    // (measuring) its blocking waits (block_current) since the last "[blocks]" line: count by length (<20 us, <50 us,
+    // <200 us, <1 ms, longer), total time, and how many ended while it spun (block_spin)
+    uint32_t blk_hist[5], blk_spun;
+    uint64_t blk_ns;
     // (hang dumps, kernel_dump_threads) the syscall it is in (-1: none) and the guest lr at it
     volatile int svc_now;
     volatile uint64_t svc_lr;

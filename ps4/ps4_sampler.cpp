@@ -37,7 +37,7 @@ namespace {
 constexpr int kSigProf = 27;    // FreeBSD value
 constexpr int kSaSiginfo = 0x40, kSaRestart = 0x0002;
 constexpr int kMcontextOffset = 0x40;  // measured on hardware (see ps4_crashlog.cpp)
-constexpr int kRipIndex = 20, kRspIndex = 23;
+constexpr int kRipIndex = 20, kRspIndex = 23, kRbpIndex = 9;
 // Samples in system libraries (libkernel/libc at 0x800000000+) are attributed to the eboot
 // function that called into them: the first eboot code address on the stack, tagged.
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kCallerTag = 1ULL << 62;
@@ -54,6 +54,7 @@ struct ThreadSamples {
     // call site, read from the return address on top of the stack ("mem<-" lines).
     uint64_t mem_callers[kMaxSamples];
     std::atomic<int> mem_caller_count{0};
+    uintptr_t stack_top = 0;  // (Savage Wind) the frame that registered it: sysCaller reads no higher
 };
 
 // The call site of a sample in one of ps4_string.c's leaf functions. They keep the frame pointer
@@ -87,6 +88,27 @@ uint64_t memCaller(uint64_t rip, uint64_t rsp) {
     return 0;
 }
 
+// (Savage Wind) The eboot function a sample inside a system module came from: the first eboot return address up the
+// frame pointer chain (the eboot keeps frame pointers; a libkernel leaf leaves rbp alone), tagged with kCallerTag in
+// mem_callers ("sys<-" lines). 0 if the chain leaves the thread's stack or never reaches the eboot.
+uint64_t sysCaller(uint64_t rbp, uint64_t rsp, uintptr_t stack_top) {
+    const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
+    const uintptr_t text_end = reinterpret_cast<uintptr_t>(__eh_frame_hdr_end);
+    uint64_t fp = rbp;
+    for (int depth = 0; depth < 16; depth++) {
+        if (fp < rsp || fp + 16 > stack_top || (fp & 7) != 0)
+            return 0;
+        const uint64_t* frame = reinterpret_cast<const uint64_t*>(fp);
+        const uint64_t ret = frame[1];
+        if (ret >= text && ret < text_end)
+            return (ret - text) | kCallerTag;
+        if (frame[0] <= fp)
+            return 0;
+        fp = frame[0];
+    }
+    return 0;
+}
+
 ThreadSamples g_threads[kMaxThreads];
 std::atomic<int> g_thread_count{0};
 
@@ -109,7 +131,10 @@ void profHandler(int, siginfo_t*, void* context) {
                 sample |= kCallerTag;
             t.samples[n] = sample;
             t.count.store(n + 1, std::memory_order_release);
-            if (const uint64_t caller = memCaller(regs[kRipIndex], regs[kRspIndex])) {
+            uint64_t caller = memCaller(regs[kRipIndex], regs[kRspIndex]);
+            if (!caller && (sample & kCallerTag))
+                caller = sysCaller(regs[kRbpIndex], regs[kRspIndex], t.stack_top);
+            if (caller) {
                 const int m = t.mem_caller_count.load(std::memory_order_relaxed);
                 if (m < kMaxSamples) {
                     t.mem_callers[m] = caller;
@@ -213,8 +238,9 @@ void report(int fd, ThreadSamples& t, double window_start) {
         std::sort(entries, entries + distinct,
                   [](const Entry& a, const Entry& b) { return a.count > b.count; });
         for (int i = 0; i < distinct && i < 200 && entries[i].count >= 2; i++) {
-            snprintf(line, sizeof(line), "  %5.1f%% mem<- 0x%llx\n", 100.0 * entries[i].count / n,
-                     static_cast<unsigned long long>(entries[i].key));
+            snprintf(line, sizeof(line), "  %5.1f%% %s<- 0x%llx\n", 100.0 * entries[i].count / n,
+                     (entries[i].key & kCallerTag) ? "sys" : "mem",
+                     static_cast<unsigned long long>(entries[i].key & ~kCallerTag));
             writeLine(fd, line);
         }
     }
@@ -605,6 +631,7 @@ extern "C" void ps4_sampler_register_thread(const char* name) {
     if (index >= kMaxThreads || (index >= kMaxThreads - 4 && name && !strncmp(name, "guest", 5)))
         return;
     g_threads[index].name = name;
+    g_threads[index].stack_top = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
     g_threads[index].thread.store(pthread_self());
     g_thread_count.store(index + 1, std::memory_order_release);
 }

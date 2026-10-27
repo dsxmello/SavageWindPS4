@@ -290,7 +290,7 @@ static void log_to_file(void) {
 }
 
 void plat_log(const char *fmt, ...) {  // (rt.h LOG)
-    char buf[2048];
+    char buf[4608];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof buf, fmt, ap);
