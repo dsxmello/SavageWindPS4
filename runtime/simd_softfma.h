@@ -138,6 +138,17 @@ static inline __attribute__((always_inline)) int sfma_fast_d(uint64_t ux, uint64
     return 0;
 }
 
+// MXCSR.RC as simd.h's simd_setround last set it on this thread: it is the host's default (nearest) outside the
+// windows where the FP slow paths round in another mode, so a load of this stands in for reading MXCSR (defined in
+// runtime/kernel.c; tools/test_softfma.c sets it with the mode it tests). Where the game code is linked into the
+// executable (the PS4) only: a game library can't import a thread-local variable on Windows.
+#if defined(__ORBIS__) && !defined(SFMA_RC_MIRROR)
+#define SFMA_RC_MIRROR 1
+#endif
+#ifdef SFMA_RC_MIRROR
+extern __thread unsigned sfma_rc;
+#endif
+
 // fma(x, y, z): the cases with an infinity, a NaN or a zero by the host's own multiply and add, which round and
 // flush as the FMA instructions do there; the rest exactly.
 #define SFMA_DEFINE(name, F, T, U, MB, EB)                                                                              \
@@ -166,6 +177,33 @@ static inline __attribute__((always_inline)) int sfma_fast_d(uint64_t ux, uint64
         memcpy(&t, &r, sizeof t);                                                                                       \
         return t;                                                                                                       \
     }
+#ifdef SFMA_RC_MIRROR
+SFMA_DEFINE(simd_soft_fma_s_full, s, float, uint32_t, 23, 8)
+#else
 SFMA_DEFINE(simd_soft_fma_s, s, float, uint32_t, 23, 8)
+#endif
 SFMA_DEFINE(simd_soft_fma_d, d, double, uint64_t, 52, 11)
 #undef SFMA_DEFINE
+
+// binary32, the common case (~10% of BOTW's main thread on the PS4, whose Jaguar has no FMA): rounding to nearest and
+// three normal operands (DAZ can't change them). The product is exact in a double and the sum rounds once; that
+// double rounds to the same float as the exact value unless it is exactly halfway between two floats (the exact value
+// may then be on either side), or below the smallest normal float (fewer bits, FTZ), which simd_soft_fma_s_full
+// (round to odd) takes. No MXCSR read, no TwoSum.
+#ifdef SFMA_RC_MIRROR
+__attribute__((noinline)) static float simd_soft_fma_s(float x, float y, float z) {
+    uint32_t ux, uy, uz;
+    memcpy(&ux, &x, 4), memcpy(&uy, &y, 4), memcpy(&uz, &z, 4);
+    // (exponent field neither 0 nor 255: (field - 1) < 254, unsigned)
+    int normal = (((ux >> 23) & 0xff) - 1u < 254u) & (((uy >> 23) & 0xff) - 1u < 254u) & (((uz >> 23) & 0xff) - 1u < 254u);
+    if (__builtin_expect(normal && !sfma_rc, 1)) {
+        double p = (double)x * (double)y;  // (two statements: never contracted into an FMA where there is one)
+        double s = p + (double)z;
+        uint64_t u;
+        memcpy(&u, &s, 8);
+        // (29 bits below a normal float's last place: halfway is the top one alone; 1023 - 126: FLT_MIN's exponent)
+        if ((u & 0x1fffffffu) != 0x10000000u && ((u >> 52) & 0x7ff) >= 1023 - 126) return (float)s;
+    }
+    return simd_soft_fma_s_full(x, y, z);
+}
+#endif

@@ -1,6 +1,7 @@
 // Checks runtime/simd_softfma.h (the game code's fma without FMA instructions) bit for bit against the FMA
 // instructions, in every MXCSR rounding mode with and without FTZ / DAZ. Needs a CPU with FMA.
 //   clang -O1 -mfma -Iruntime tools/test_softfma.c -o build/test_softfma && build/test_softfma [millions] [seed]
+// -DSFMA_RC_MIRROR: the PS4's binary32 fast path (simd_softfma.h sfma_rc, set here as simd_setround would).
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,10 @@
 #include <xmmintrin.h>
 
 #include "simd_softfma.h"
+
+#ifdef SFMA_RC_MIRROR
+__thread unsigned sfma_rc;
+#endif
 
 #ifndef __FMA__
 #error "build with -mfma: the FMA instructions are the reference"
@@ -116,8 +121,14 @@ int main(int argc, char **argv) {
             uint32_t ux = (uint32_t)c.x, uy = (uint32_t)c.y, uz = (uint32_t)c.z, uw, ug;
             memcpy((float *)&x, &ux, 4), memcpy((float *)&y, &uy, 4), memcpy((float *)&z, &uz, 4);
             _mm_setcsr(csr);
+#ifdef SFMA_RC_MIRROR
+            sfma_rc = mode & 3;
+#endif
             float w = __builtin_fmaf(x, y, z), g = simd_soft_fma_s(x, y, z);
             _mm_setcsr(0x1f80);
+#ifdef SFMA_RC_MIRROR
+            sfma_rc = 0;
+#endif
             memcpy(&uw, &w, 4), memcpy(&ug, &g, 4);
             want = uw, got = ug;
             nan_want = w != w, nan_got = g != g;

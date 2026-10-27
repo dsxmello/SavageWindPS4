@@ -344,6 +344,9 @@ static uint64_t next_thread_id = 0x50;
 // none of those hold a host lock across a call into the guest, so nothing stays locked. svcExitThread ends a
 // thread the same way.
 volatile int g_rt_unwind;
+#ifdef __ORBIS__
+__thread unsigned sfma_rc;  // (simd_softfma.h) MXCSR.RC as simd_setround last set it on this thread
+#endif
 static KThread *g_threads;  // every thread of this boot (g_klock)
 
 static pthread_t g_host_threads[4];  // (profiling) host threads the sampler takes too: handles 0xf000 + i

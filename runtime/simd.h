@@ -230,7 +230,16 @@ SI int simd_getround(void) {
     static const int m[4] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
     return m[(_mm_getcsr() >> 13) & 3u];
 }
-SI void simd_setround(int fe) { _mm_setcsr((_mm_getcsr() & ~0x6000u) | simd_rc(fe) << 13); }
+#ifdef __ORBIS__
+extern __thread unsigned sfma_rc;  // (simd_softfma.h) the RC set here, mirrored for the soft FMA's fast path
+#endif
+SI void simd_setround(int fe) {
+    unsigned rc = simd_rc(fe);
+#ifdef __ORBIS__
+    sfma_rc = rc;
+#endif
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | rc << 13);
+}
 // MSR FPCR. FZ (flush denormal inputs and results to signed zero) is MXCSR's DAZ (inputs) and FTZ (results) on x86-64,
 // so the FP ops keep their fast paths: BOTW 1.8.2 sets FZ at the start of its threads (main 0x7000b4de30, the thread
 // entry 0x70000c4e3c), and the software flush sent every FP op down the slow path (~40% of the main thread's time in
