@@ -139,16 +139,32 @@ static bool host_work(void) {
 }
 // SAVAGEWIND_TIMELINE=<first frame>:<frames>: "[tl]" lines (ms, guest thread, event) for submits, fences, GPU
 // waits and presents of those presented frames: who waits for whom within a frame.
+// SAVAGEWIND_TIMELINE=f9:<frames>: from the frame after F9 (L3+R3 on the PS4) instead of a debug frame dump.
 uint64_t renderer_present_count(void);
 uint64_t vk_completed_seq(void);
 uint64_t renderer_fence_seq(void);
+static int64_t tl_from = -2, tl_count;
+static bool tl_on_f9;
+static void timeline_init(void) {
+    if (tl_from != -2) return;
+    const char *e = getenv("SAVAGEWIND_TIMELINE");
+    tl_from = -1;
+    if (!e) return;
+    const char *c = strchr(e, ':');
+    tl_count = c ? atoll(c + 1) : 60;
+    if (!strncmp(e, "f9", 2)) tl_on_f9 = true;
+    else tl_from = atoll(e);
+}
+bool nvn_timeline_take_f9(void) {  // (device.c, at F9) true: the timeline starts with the next frame
+    timeline_init();
+    if (!tl_on_f9) return false;
+    tl_from = (int64_t)renderer_present_count() + 1;
+    LOG("[tl] timeline: frames %lld to %lld\n", (long long)tl_from, (long long)(tl_from + tl_count - 1));
+    return true;
+}
 bool nvn_timeline(void) {
-    static int64_t from = -2, count;
-    if (from == -2) {
-        const char *e = getenv("SAVAGEWIND_TIMELINE");
-        from = -1;
-        if (e) { from = atoll(e); const char *c = strchr(e, ':'); count = c ? atoll(c + 1) : 60; }
-    }
+    timeline_init();
+    int64_t from = tl_from, count = tl_count;
     if (from < 0) return false;
     uint64_t f = renderer_present_count();
     return f >= (uint64_t)from && f < (uint64_t)(from + count);

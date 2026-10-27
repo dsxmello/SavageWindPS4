@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -286,6 +287,21 @@ static void log_to_file(void) {
     dup2(fd, 1);
     if (fd > 2) close(fd);
     setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+void plat_log(const char *fmt, ...) {  // (rt.h LOG)
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof buf) n = sizeof buf - 1;
+    for (int off = 0; off < n;) {
+        ssize_t w = write(2, buf + off, (size_t)(n - off));
+        if (w <= 0) break;
+        off += (int)w;
+    }
 }
 
 // Calling into a system library whose module isn't loaded kills the title: load them first (DolphinPS4, dusklight).

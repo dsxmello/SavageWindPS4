@@ -646,9 +646,14 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
-    if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
-        LOG("[tl] %.3f %x block %.3f ms (kind %d addr %llx lr %llx)\n", plat_now_ns() / 1e6, t->handle,
-            (plat_now_ns() - tl_t0) / 1e6, kind, (unsigned long long)tl_addr, (unsigned long long)t->cpu.x[30]);
+    // (integers only: on the PS4 this runs on a stack generated code left unaligned, and printf's floats (SSE spills)
+    // faulted there)
+    if (tl_t0 && plat_now_ns() - tl_t0 > 200000) {
+        uint64_t now_us = plat_now_ns() / 1000, us = now_us - tl_t0 / 1000;
+        LOG("[tl] %llu.%03llu %x block %llu.%03llu ms (kind %d addr %llx lr %llx)\n", (unsigned long long)(now_us / 1000),
+            (unsigned long long)(now_us % 1000), t->handle, (unsigned long long)(us / 1000), (unsigned long long)(us % 1000),
+            kind, (unsigned long long)tl_addr, (unsigned long long)t->cpu.x[30]);
+    }
     return t->wait_result;
 }
 
@@ -838,9 +843,12 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         extern bool nvn_timeline(void);
         uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0;
         bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
-        if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
-            LOG("[tl] %.3f %x waitsync %.3f ms (handle %x lr %llx)\n", plat_now_ns() / 1e6, t->handle,
-                (plat_now_ns() - tl_t0) / 1e6, hs[0], (unsigned long long)t->cpu.x[30]);
+        if (tl_t0 && plat_now_ns() - tl_t0 > 200000) {  // (integers only: see block_current)
+            uint64_t now_us = plat_now_ns() / 1000, us = now_us - tl_t0 / 1000;
+            LOG("[tl] %llu.%03llu %x waitsync %llu.%03llu ms (handle %x lr %llx)\n", (unsigned long long)(now_us / 1000),
+                (unsigned long long)(now_us % 1000), t->handle, (unsigned long long)(us / 1000), (unsigned long long)(us % 1000),
+                hs[0], (unsigned long long)t->cpu.x[30]);
+        }
         for (KThread **p = &g_syncwaiters; *p; p = &(*p)->snext)
             if (*p == t) { *p = t->snext; break; }
         t->in_sync_wait = false;
