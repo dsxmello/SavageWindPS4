@@ -166,7 +166,7 @@ bool nvn_timeline(void) {
 // game fences its CPU writes to memory in use (as it must on the console).
 // At most QUEUE_AHEAD presents wait in the queue (SAVAGEWIND_QUEUE_AHEAD, default 1): a guest further ahead waits.
 // SAVAGEWIND_ASYNC_EXEC=0: everything runs on the calling thread (as before).
-enum { QOP_EXEC, QOP_FENCE, QOP_PRESENT, QOP_TEXTURE_FINALIZE, QOP_SYNC_FREE };
+enum { QOP_EXEC, QOP_FENCE, QOP_PRESENT, QOP_TEXTURE_FINALIZE, QOP_TEXTURE_REVIVE, QOP_SYNC_FREE };
 typedef struct { int op; uint64_t a; void *p; } QOp;
 #define QCAP 4096
 static QOp g_q[QCAP];
@@ -216,6 +216,7 @@ static void qop_run(const QOp *o) {
         if (frame_split()) frame_split_log();
         break;
     case QOP_TEXTURE_FINALIZE: backend_texture_destroyed(o->p); ((NvnTexture *)o->p)->finalized = true; break;
+    case QOP_TEXTURE_REVIVE: ((NvnTexture *)o->p)->finalized = false; break;  // (initialized again: see nvnTextureInitialize)
     case QOP_SYNC_FREE: free(o->p); break;
     }
 }
@@ -629,6 +630,48 @@ static bool tex_set_has(uintptr_t p) {  // (lock held)
     return false;
 }
 
+// Host textures by state: BOTW initializes NVNtexture objects again all the time with the same state (agl rebuilds a
+// texture's object whenever its data is set; the exposure chain's steps every frame): ~5000 a second in the open
+// world, and as none is freed the PS4's 1 GB host heap ran out after ~13 minutes (1.9 million textures). A texture
+// initialized with the state of one made before takes that one: on hardware the two are the same texture anyway
+// (nvnTextureCompare). SAVAGEWIND_TEX_NO_INTERN=1: a new host object each time, as before.
+static uintptr_t *g_intern;
+static uint32_t g_intern_cap, g_intern_n, g_tex_inits;
+static bool tex_same_state(const NvnTexture *a, const NvnTexture *b) {
+    return a->target == b->target && a->format == b->format && a->flags == b->flags && a->width == b->width &&
+           a->height == b->height && a->depth == b->depth && a->levels == b->levels && a->samples == b->samples &&
+           a->ds_mode == b->ds_mode && !memcmp(a->swizzle, b->swizzle, sizeof a->swizzle) && a->stride == b->stride &&
+           a->addr == b->addr && a->pool == b->pool && a->pool_offset == b->pool_offset &&
+           !memcmp(&a->layout, &b->layout, sizeof a->layout);  // (calloc'd and filled alike: padding is zero)
+}
+static uint32_t intern_slot(const NvnTexture *t) {
+    uint64_t h = t->addr ^ (uint64_t)t->format << 40 ^ (uint64_t)t->width << 20 ^ t->height ^ (uint64_t)t->levels << 56 ^
+                 (uint64_t)t->target << 60 ^ t->stride * 31 ^ t->layout.layers * 0x1000193ull;
+    return (uint32_t)(h * 0x9E3779B97F4A7C15ull >> 32) & (g_intern_cap - 1);
+}
+static void intern_put(NvnTexture *t) {  // (lock held)
+    if ((g_intern_n + 1) * 2 > g_intern_cap) {
+        uintptr_t *old = g_intern;
+        uint32_t oc = g_intern_cap;
+        g_intern_cap = g_intern_cap ? g_intern_cap * 2 : 4096;
+        g_intern = calloc(g_intern_cap, sizeof *g_intern);
+        g_intern_n = 0;
+        for (uint32_t i = 0; i < oc; i++)
+            if (old[i]) intern_put((NvnTexture *)old[i]);
+        free(old);
+    }
+    uint32_t i = intern_slot(t);
+    while (g_intern[i]) i = (i + 1) & (g_intern_cap - 1);
+    g_intern[i] = (uintptr_t)t;
+    g_intern_n++;
+}
+static NvnTexture *intern_find(const NvnTexture *t) {  // (lock held)
+    if (!g_intern_cap) return NULL;
+    for (uint32_t i = intern_slot(t); g_intern[i]; i = (i + 1) & (g_intern_cap - 1))
+        if (tex_same_state((NvnTexture *)g_intern[i], t)) return (NvnTexture *)g_intern[i];
+    return NULL;
+}
+
 // (debugging) log the textures whose storage holds guest address a
 void nvn_debug_textures_at(uint64_t a) {
     pthread_mutex_lock(&g_tex_lock);
@@ -646,21 +689,51 @@ void nvn_debug_textures_at(uint64_t a) {
     pthread_mutex_unlock(&g_tex_lock);
 }
 
+// Host textures made this boot (none freed: see nvnTextureFinalize) and nvnTextureInitialize calls, for the PS4's
+// memory lines
+uint32_t nvn_texture_count(uint32_t *inits) {
+    pthread_mutex_lock(&g_tex_lock);
+    uint32_t n = g_tex_n;
+    if (inits) *inits = g_tex_inits;
+    pthread_mutex_unlock(&g_tex_lock);
+    return n;
+}
+
 RT_ON_RESET(tex_set_reset) {  // (after the renderer's reset: no image is left)
     for (uint32_t i = 0; i < g_tex_cap; i++) free((void *)g_tex_set[i]);
     free(g_tex_set);
     g_tex_set = NULL;
     g_tex_cap = g_tex_n = 0;
+    free(g_intern);
+    g_intern = NULL;
+    g_intern_cap = g_intern_n = g_tex_inits = 0;
 }
 
 NVN(nvnTextureInitialize) {
+    static int intern = -1;
+    if (intern < 0) intern = !getenv("SAVAGEWIND_TEX_NO_INTERN");
     NvnTexture *t = texture_from_builder(A(1));
     if (t->flags & 2)
         LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", t, t->width, t->height,
             t->format, t->flags, t->target, t->addr, t->stride);
     pthread_mutex_lock(&g_tex_lock);
-    tex_set_put((uintptr_t)t);
+    g_tex_inits++;
+    NvnTexture *same = intern ? intern_find(t) : NULL;
+    bool revive = false;
+    if (same) {
+        free(t);
+        t = same;
+        revive = t->fin_asked;
+        t->fin_asked = false;
+    } else {
+        tex_set_put((uintptr_t)t);
+        if (intern) intern_put(t);
+    }
     pthread_mutex_unlock(&g_tex_lock);
+    // Finalized before: alive again (on the submission thread, after the finalize queued for it; not under g_tex_lock,
+    // which that thread takes, as a full queue waits)
+    if (revive && async_exec()) queue_put(QOP_TEXTURE_REVIVE, 0, t);
+    else if (revive) t->finalized = false;
     SET_HOST(A(0), t);
     RET(1);
 }
@@ -681,12 +754,13 @@ NvnTexture *nvn_texture_host(uint64_t guest) {
 // Only the renderer's image goes; the host object stays, and so does the guest object's pointer to it. BOTW copies
 // NVNtexture objects and finalizes one copy while it keeps drawing with another, and keeps texture pool entries
 // registered with finalized textures: on hardware those just go on reading the texture's memory. (A texture
-// initialized again in the same object gets a new host object.)
+// initialized again in the same object gets a new host object, or the one of the same state.)
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     if (!t) return;
     pthread_mutex_lock(&g_tex_lock);
     bool known = tex_set_has((uintptr_t)t);
+    if (known) t->fin_asked = true;
     pthread_mutex_unlock(&g_tex_lock);
     if (!known) {
         static int logged;

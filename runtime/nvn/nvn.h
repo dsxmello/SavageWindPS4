@@ -33,6 +33,7 @@ typedef struct NvnTexture {
     int backend_slot;  // (Vulkan backend) slot in textures.c's list of textures holding an image, + 1
     uint64_t debug_id;
     bool finalized;  // nvnTextureFinalize ran (the object stays: pool entries and copies may still name it)
+    bool fin_asked;  // (objects.c, under its lock) the guest finalized it: one initialized with its state revives it
     uint32_t cpu_levels;  // levels nvnTextureWriteTexels filled since the renderer last uploaded them (bit per level)
     char label[64];
 } NvnTexture;

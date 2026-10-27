@@ -543,7 +543,7 @@ static void zombies_expire(void) {  // (gpu lock held)
     for (int i = 0; i < g_nzombies; i++) {
         NvnTexture *t = g_zombies[i];
         TexBackend *b = t->backend;
-        if (!b) continue;
+        if (!b || !t->finalized) continue;  // (initialized again since: a live texture, see nvnTextureInitialize)
         if (now - b->used_frame > PARK_FRAMES) release_backend(t);
         else g_zombies[k++] = t;
     }
@@ -642,11 +642,13 @@ static uint64_t hash_full(const uint8_t *p, uint64_t n) {
     return h ^ (h >> 31);
 }
 
-// 8 bytes at each of up to 2048 places (a byte at each of 4096 was a cache miss per byte: ~50 textures a frame are
-// sampled in the open world).
+// 8 bytes at each of up to 512 places (a byte at each of 4096 was a cache miss per byte: ~50 textures a frame are
+// sampled in the open world; 2048 places were still ~2.5% of the PS4's queue thread). A texture the game streams
+// new texels into changes all over; a partly rewritten one is caught by the full hash (every 120 frames, and every
+// frame once it has changed: dynamic).
 static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     uint64_t h = 1469598103934665603ull;
-    uint64_t words = n / 8, step = words > 2048 ? words / 2048 : 1;
+    uint64_t words = n / 8, step = words > 512 ? words / 512 : 1;
     for (uint64_t i = 0; i < words; i += step) { uint64_t w; memcpy(&w, p + i * 8, 8); h = (h ^ w) * 1099511628211ull; h ^= h >> 29; }
     for (uint64_t i = words * 8; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h ^ n;

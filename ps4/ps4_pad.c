@@ -90,7 +90,9 @@ static Sint16 stick_axis(uint8_t v) {  // 0..255, 128 centered -> SDL's -32768..
     int s = ((int)v - 128) * 256;
     return (Sint16)(s > 32767 ? 32767 : s);
 }
-static Sint16 trigger(uint8_t v) { return (Sint16)(v * 32767 / 255); }  // 0..32767
+// 0..255 -> SDL's full axis range: a virtual gamepad's trigger rests at -32768 (SDL_virtualjoystick.c), and 0 read
+// as half pressed (ZL held: Link always walked locked on)
+static Sint16 trigger(uint8_t v) { return (Sint16)(v * 65535 / 255 - 32768); }
 
 void ps4_pad_poll(void) {
     if (!g_ready) {

@@ -346,7 +346,13 @@ static KThread *g_threads;  // every thread of this boot (g_klock)
 
 static pthread_t g_host_threads[4];  // (profiling) host threads the sampler takes too: handles 0xf000 + i
 static int g_nhost_threads;
+#ifdef __ORBIS__
+void ps4_profile_thread(const char *name);  // (platform/ps4.c: SAVAGEWIND_PS4_SAMPLE)
+#endif
 void kernel_sample_host_thread(void) {
+#ifdef __ORBIS__
+    ps4_profile_thread("queue");
+#endif
     pthread_mutex_lock(&g_klock);
     if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
     pthread_mutex_unlock(&g_klock);
@@ -392,6 +398,9 @@ static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
     crash_handler_install();
+#ifdef __ORBIS__
+    { char nm[32]; snprintf(nm, sizeof nm, "guest h%x prio %d", t->handle, t->prio); ps4_profile_thread(nm); }
+#endif
     rt_set_fpcr(0);
     core_acquire(t);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
@@ -432,7 +441,10 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
 // what the game really needs before a console with less address space and memory (the PS4: 16 MB by default).
 static size_t host_stack_size(void) {
 #ifdef __ORBIS__
-    size_t mb = 16;  // (direct memory, all of it backed: plat_alloc_stack; BOTW 1.8.2 starts ~43 threads)
+    // (direct memory, all of it backed, in 2 MiB blocks: plat_alloc_stack; BOTW 1.8.2 starts ~47 threads.) 16 MB each
+    // took 752 MB and the open world ran out of direct memory; the deepest any used was 20 KB (the memory report's
+    // "deepest used", 0.21), and an overflow now faults on the guard below the stack
+    size_t mb = 2;
 #else
     size_t mb = 256;
 #endif

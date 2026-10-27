@@ -253,13 +253,14 @@ static void create_device(void) {
         ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
         ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
     }
-    {
+#endif
+    {   // (also on the PS4, whose driver is RADV: exec.c ubo_dynamic_mark_stage)
         VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         g_vk.radv = drv.driverID == VK_DRIVER_ID_MESA_RADV;
+        if (g_vk.radv) LOG("[vk] RADV: the game's dynamic uniform buffers in the vertex stage's set only\n");
     }
-#endif
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;

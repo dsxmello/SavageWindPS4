@@ -25,7 +25,7 @@
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
-int maxwell_dbg_reg;
+int maxwell_dbg_reg, maxwell_dbg_reg_gba[3] = {-1, -1, -1};
 const uint8_t *maxwell_dbg_vs;
 
 #define RZ 255
@@ -2215,7 +2215,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
-    if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
+    if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  vec4 dbgv = vec4(1.0f);\n" : "  vec4 dbgv = vec4(-1.0f);\n");
     if (c->structured) {
         sp(&s, "  bool exited = false; uint loops = 0u;\n");
         sp(&s, "%s", body.buf ? body.buf : "");
@@ -2242,8 +2242,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             for (int comp = 0; comp < 4; comp++) {
                 if (!(m & (1u << comp))) continue;
                 if (dbg) {
-                    if (comp == 3) sp(&s, "  c%d[%d] = %s(1.0f);\n", rt, comp, cv);
-                    else sp(&s, "  c%d[%d] = %s(dbgv);\n", rt, comp, cv);
+                    // SAVAGEWIND_DBG_FS_SIGNED=1: x / (1 + |x|) * 0.5 + 0.5, any value into (0, 1) for an 8-bit target
+                    // (0 -> 0.5; x = (2y - 1) / (1 - |2y - 1|) gives it back)
+                    static int sgn = -1;
+                    if (sgn < 0) sgn = getenv("SAVAGEWIND_DBG_FS_SIGNED") != NULL;
+                    if (comp == 3 && maxwell_dbg_reg_gba[2] < 0) sp(&s, "  c%d[%d] = %s(1.0f);\n", rt, comp, cv);
+                    else if (sgn) sp(&s, "  c%d[%d] = %s(dbgv[%d] / (1.0f + abs(dbgv[%d])) * 0.5f + 0.5f);\n", rt, comp, cv, comp, comp);
+                    else sp(&s, "  c%d[%d] = %s(dbgv[%d]);\n", rt, comp, cv, comp);
                 } else if (r < 256 && c->reg_used[r]) {
                     if (kind == 0) sp(&s, "  c%d[%d] = as_f(r%d);\n", rt, comp, r);
                     else sp(&s, "  c%d[%d] = %s(r%d);\n", rt, comp, cv, r);
@@ -2575,10 +2580,19 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         emit_insn(c, ((const uint64_t *)code)[i], pc);
         if (dbg && pc == maxwell_dbg_pc) {
-            int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
-            c->reg_used[rr] = 1;
-            if (half) sp(&c->body, c->glsl ? "    dbgv = unpackHalf2x16(r%d)[%d];\n" : "    dbgv = float(as_type<half2>(r%d)[%d]);\n", rr, half - 1);
-            else sp(&c->body, "    dbgv = as_type<float>(r%d);\n", rr);
+            int regs[4] = {maxwell_dbg_reg, maxwell_dbg_reg_gba[0], maxwell_dbg_reg_gba[1], maxwell_dbg_reg_gba[2]};
+            bool one = regs[1] < 0 && regs[2] < 0 && regs[3] < 0;  // (GLSL: one register in every channel, or one each)
+            for (int k = 0; k < (c->glsl ? 4 : 1); k++) {
+                if (regs[k] < 0) continue;
+                int rr = regs[k] % 1000, half = regs[k] / 1000;  // +1000: low f16, +2000: high f16
+                c->reg_used[rr] = 1;
+                char v[48];
+                if (half) snprintf(v, sizeof v, c->glsl ? "unpackHalf2x16(r%d)[%d]" : "float(as_type<half2>(r%d)[%d])", rr, half - 1);
+                else snprintf(v, sizeof v, c->glsl ? "uintBitsToFloat(r%d)" : "as_type<float>(r%d)", rr);
+                if (!c->glsl) sp(&c->body, "    dbgv = %s;\n", v);
+                else if (one) sp(&c->body, "    dbgv = vec4(%s);\n", v);
+                else sp(&c->body, "    dbgv[%d] = %s;\n", k, v);
+            }
         }
         info->num_insts++;
     }

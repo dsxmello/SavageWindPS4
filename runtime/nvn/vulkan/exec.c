@@ -219,10 +219,12 @@ static void ring_retire(void);
 
 // ---- SAVAGEWIND_GPUPROF_AT=<frame>: GPU time per pass / dispatch / copy of that frame, logged as "[gpuprof]".
 // A timestamp (ALL_COMMANDS: after everything before it) at each mark; a row = the work since the previous mark.
+// SAVAGEWIND_GPUPROF_DRAWS=1: a mark after every draw too (each draw then runs alone on the GPU: the times add up to
+// more than the frame's, but show which draws cost); the draw rows under 0.05 ms are left out of the log.
 bool g_gpuprof_frame;
 static VkQueryPool gp_qp;
-static int gp_n;
-#define GP_MAX 4096  // (an open-world frame has ~1500 marks)
+static int gp_n, gp_row;  // marks so far; the last one that isn't a draw's
+#define GP_MAX 16384  // (an open-world frame has ~1500 marks, ~4500 with a mark per draw)
 static char gp_label[GP_MAX][112];
 static uint32_t gp_draws[GP_MAX];
 // SAVAGEWIND_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with SAVAGEWIND_SYNC_SUBMIT=1 the
@@ -257,6 +259,7 @@ static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     vsnprintf(gp_label[gp_n], sizeof gp_label[0], fmt, ap);
     va_end(ap);
     gp_draws[gp_n] = 0;
+    if (strncmp(gp_label[gp_n], "draw ", 5)) gp_row = gp_n;
     gp_n++;
 }
 void renderer_flush(void);
@@ -267,11 +270,15 @@ void vk_gpuprof_report(void) {
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
+        int quiet = 0;
+        double quiet_ms = 0;
         for (int i = 0; i + 1 < gp_n; i++) {
             double ms = (t[i + 1] - t[i]) * per;
+            if (!strncmp(gp_label[i], "draw ", 5) && ms < 0.05) { quiet++; quiet_ms += ms; continue; }
             LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i], gp_draws[i] ? "" : "\n");
             if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
         }
+        if (quiet) LOG("[gpuprof] (%d draws under 0.05 ms left out: %.2f ms)\n", quiet, quiet_ms);
     }
     gp_n = 0;
 }
@@ -530,6 +537,62 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
         if (addr < uubt[i].hi && uubt[i].lo < addr + size) mask |= 1ull << i;
     e->addr = addr; e->size = size; e->gen = gen; e->serial = uub_serial; e->mask = mask; e->chunk = active; e->span = s;
     return s;
+}
+
+// Constant buffers read in place from the imported guest heap, as the console's GPU reads them (the game fences its
+// CPU writes to memory in use, and waits for the GPU as it would there), instead of copied per command list: the
+// copies were ~15 MB and ~30000 lookups a frame in the open world, the biggest memcpy on the PS4's queue thread.
+// Copied still: ranges UpdateUniformBuffer writes (it writes when the list is translated, ahead of the GPU: a draw
+// before it would see its data), kept from list to list (BOTW updates the same ~40 small ranges every frame); memory
+// outside the heap; and what the patches below change. A range updated for the first time with constant buffers of
+// this list already read in place waits for the GPU first (once per range: the copies take over from then on).
+// PS4 by default; SAVAGEWIND_VK_UBO_DIRECT=0 / 1 turns it off / on (the PC: off by default).
+#define UUBS_MAX 256
+static struct { uint64_t lo, hi; } uubs[UUBS_MAX];  // every range UpdateUniformBuffer wrote since the boot
+static int nuubs;
+static bool uubs_full, ubo_direct_used;  // (no room: every constant buffer copied; read in place in this list)
+static bool ubo_direct_on(void) {
+    static int on = -1;
+    if (on < 0) {
+#ifdef __ORBIS__
+        on = 1;
+#else
+        on = 0;
+#endif
+        if (getenv("SAVAGEWIND_VK_UBO_DIRECT")) on = atoi(getenv("SAVAGEWIND_VK_UBO_DIRECT")) != 0;
+        LOG("[vk] constant buffers %s\n", on ? "read in place from the guest heap" : "copied");
+    }
+    return on && !uubs_full;
+}
+static uint64_t uubs_gen = 1;  // (bumped as the ranges change: the memo below)
+static bool uubs_overlaps(uint64_t lo, uint64_t hi) {
+    // (memo by range: the same constant buffers come back draw after draw; ~40 ranges compared each time otherwise)
+    static struct { uint64_t lo, hi, gen; bool r; } memo[256];
+    uint32_t k = (uint32_t)((lo >> 8) ^ (hi >> 4) ^ (lo >> 20)) & 255;
+    if (memo[k].gen == uubs_gen && memo[k].lo == lo && memo[k].hi == hi) return memo[k].r;
+    bool r = false;
+    for (int i = 0; i < nuubs && !r; i++) r = lo < uubs[i].hi && uubs[i].lo < hi;
+    memo[k].lo = lo; memo[k].hi = hi; memo[k].gen = uubs_gen; memo[k].r = r;
+    return r;
+}
+static void ubo_wait_gpu(void);
+// Before UpdateUniformBuffer writes [lo, hi)
+static void uubs_note(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < nuubs; i++)
+        if (uubs[i].lo <= lo && hi <= uubs[i].hi) return;  // (known)
+    if (ubo_direct_used) ubo_wait_gpu();  // (draws of this list may read it in place, still to run)
+    int i = 0;
+    while (i < nuubs && !(lo <= uubs[i].hi && uubs[i].lo <= hi)) i++;
+    uubs_gen++;
+    if (i < nuubs) {  // (overlapping or touching: grown)
+        if (lo < uubs[i].lo) uubs[i].lo = lo;
+        if (hi > uubs[i].hi) uubs[i].hi = hi;
+    } else if (nuubs < UUBS_MAX) {
+        uubs[nuubs].lo = lo; uubs[nuubs].hi = hi; nuubs++;
+    } else if (!uubs_full) {
+        uubs_full = true;
+        LOG("[vk] more than %d ranges written by UpdateUniformBuffer: constant buffers copied from now on\n", UUBS_MAX);
+    }
 }
 
 // ================================================================== worker threads (shader / pipeline builds)
@@ -809,12 +872,20 @@ static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 // (debugging) SAVAGEWIND_TRACE_TEX (textures.c): texture write histories
 bool vk_trace_tex(NvnTexture *t);
+// (SAVAGEWIND_TRACE_TEX unset: no call into textures.c, three times a draw)
+static bool trace_tex(NvnTexture *t) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_TRACE_TEX") != NULL;
+    return on && vk_trace_tex(t);
+}
 void vk_trace_event(NvnTexture *t, uint64_t key, NvnTexture *const *srcs, int nsrcs, const char *fmt, ...);
 void vk_trace_dump(NvnTexture *t);
 
 static int debug_pass_no;
 static NvnTexture *pass_dbg[8];  // (debug frame) the color targets of the pass in progress
+static uint32_t pass_dbg_lv[8], pass_dbg_layer[8];  // (debug frame) the level and layer each one draws into
 static int pass_dbg_n, pass_dbg_draws;
+static void debug_log_stats(NvnTexture *t, int pass, int slot, uint32_t lv, uint32_t layer);  // (debug frames)
 
 // ---- linear render targets (NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) go back to guest memory: the CPU reads them.
 // BOTW samples its sky into an 8x8 RGBA32F linear target and reads the texels back for its fog and ambient colours
@@ -1065,6 +1136,18 @@ static void vk_end_pass_at(int line) {
     pass_nfbl = 0;
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
+    // (debug frame) SAVAGEWIND_DEBUG_STATS=1: no PNGs; each colour target of each pass (target 0 or not) as numbers,
+    // per channel in its own format ("[stats]" lines), which compare across GPUs and render scales: the PNGs clamp
+    // floats to 8 bits and skip the passes without a target 0
+    static int stats = -1;
+    if (stats < 0) stats = getenv("SAVAGEWIND_DEBUG_STATS") != NULL;
+    if (g_debug_frame && pass_dbg_n && stats) {
+        int k = debug_pass_no++;
+        LOG("[stats] pass %03d: %d targets, %d draws\n", k, pass_dbg_n, pass_dbg_draws);
+        for (int i = 0; i < pass_dbg_n; i++)
+            if (pass_dbg[i] && pass_dbg[i]->backend) debug_log_stats(pass_dbg[i], k, i, pass_dbg_lv[i], pass_dbg_layer[i]);
+        return;
+    }
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
     if (g_debug_frame && pass_dbg_n && pass_dbg[0] && pass_dbg[0]->backend) {
         char path[256];
@@ -1157,7 +1240,11 @@ static void begin_pass(void) {
     pass_out = false;
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_dbg_n = st.rt.ncolor > 8 ? 8 : st.rt.ncolor;
-    for (int i = 0; i < pass_dbg_n; i++) pass_dbg[i] = st.rt.color[i];
+    for (int i = 0; i < pass_dbg_n; i++) {
+        pass_dbg[i] = st.rt.color[i];
+        pass_dbg_lv[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
+        pass_dbg_layer[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 2) ? st.rt.cview[i].min_layer : 0;
+    }
     {   // (debugging) SAVAGEWIND_LOG_RENDER_TEX=<w>x<h>: passes that draw into textures of that size
         static int lw = -1, lh;
         if (lw < 0) { lw = 0; if (getenv("SAVAGEWIND_LOG_RENDER_TEX")) sscanf(getenv("SAVAGEWIND_LOG_RENDER_TEX"), "%dx%d", &lw, &lh); }
@@ -1607,11 +1694,16 @@ static void ubo_dynamic_mark(VkBindingInfo *b, int n) {
 // The same for one stage's own set (graphics pipeline libraries: a stage's set layout is made before the stage it pairs
 // with is known, so each set gets a fixed share of the layout's limit: the vertex set half, rounded up, the fragment set
 // the rest).
+// RADV: the vertex set all of it. RADV numbers a set's dynamic buffers after those of the sets before it in the layout
+// a library is made with, into the shader's code; the fragment library's layout has no set 0 (independent sets), so
+// its shader, linked after a vertex set with some, read the vertex set's buffers: BOTW's sun shadow pass read its c4
+// matrices from the vertex stage's 432-byte c4 (zeros past the end on AMD) and the world went white, the title
+// screen's picture got the vertex stage's c3 for its colour and came out black (PS4).
 static void ubo_dynamic_mark_stage(VkBindingInfo *b, int n, uint32_t set) {
     if (!ubo_dynamic_on()) return;
     uint32_t lim = g_vk.props.limits.maxDescriptorSetUniformBuffersDynamic, k = 0;
     if (lim > 32) lim = 32;
-    uint32_t share = set == 0 ? (lim + 1) / 2 : lim / 2;
+    uint32_t share = g_vk.radv ? (set == 0 ? lim : 0) : set == 0 ? (lim + 1) / 2 : lim / 2;
     for (int i = 0; i < n && k < share; i++)
         if (b[i].set == set && b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b[i].binding >= 3 && b[i].binding < 17) {
             b[i].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -1751,6 +1843,7 @@ static void translate_program(void *arg) {
     {   // SAVAGEWIND_DBG_FS=<fs code addr hex>:<pc hex>:<reg>: that register after that instruction, as every output
         // (pc ffffffff: 1.0, where the shader runs at all), as in renderer.m. The shader can also be named
         // w<pc hex>=<word hex> (see FsSel) in place of its address, which changes from run to run.
+        // <reg>,<reg>,<reg>,<reg>: up to four registers, as red, green, blue and alpha (SAVAGEWIND_DEBUG_STATS reads them)
         static unsigned long long dbg_addr;
         static unsigned dbg_pc;
         static int dbg_reg, parsed;
@@ -1758,8 +1851,9 @@ static void translate_program(void *arg) {
         if (!parsed) {
             parsed = 1;
             const char *e = getenv("SAVAGEWIND_DBG_FS");
-            if (e && *e == 'w') { fs_sel_parse(e, &sel, 1); e = strchr(e, ':'); if (e) sscanf(e, ":%x:%d", &dbg_pc, &dbg_reg); }
-            else if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg);
+            int *g = maxwell_dbg_reg_gba;
+            if (e && *e == 'w') { fs_sel_parse(e, &sel, 1); e = strchr(e, ':'); if (e) sscanf(e, ":%x:%d,%d,%d,%d", &dbg_pc, &dbg_reg, &g[0], &g[1], &g[2]); }
+            else if (e) sscanf(e, "%llx:%x:%d,%d,%d,%d", &dbg_addr, &dbg_pc, &dbg_reg, &g[0], &g[1], &g[2]);
         }
         if (sel.word) dbg_addr = fs_sel_match(&sel, p->code[1], 0) ? p->code[1] : 0;
         maxwell_dbg_code = dbg_addr ? (const uint8_t *)(uintptr_t)dbg_addr : NULL;
@@ -2892,6 +2986,7 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
 }
 
 static bool gw_ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
+static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
 
 // Shadow maps made bigger than the game's (Video > Shadow resolution, textures.c RS_SHADOW): the shaders that filter
 // them offset their taps by a texel size the game passes in a constant buffer (BOTW's deferred sun shadow passes:
@@ -3021,19 +3116,29 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         NvnShaderStage *ss = &st.program->stages[stage];
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
+        VkDescriptorBufferInfo d;
+        if (ubo_direct(ss->code_addr + ss->const_offset, size, &d)) return d;
         return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
     }
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
-    if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
+    uint64_t want = size;  // (debug frames: what the shader reads, against what the game bound)
+    if (!r.addr) {
+        if (g_debug_frame) LOG("[cb] stage %d c%d: not bound (the shader reads %llu bytes: zeros)\n", stage, k, (unsigned long long)want);
+        return ubo_span(vk_transient_copy(zeros, size, 256), size);
+    }
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
+    if (g_debug_frame && want > size)
+        LOG("[cb] stage %d c%d @%llx: bound %llu bytes, the shader reads %llu (dynamic %d)\n", stage, k,
+            (unsigned long long)r.addr, (unsigned long long)r.size, (unsigned long long)want, !!(si->cbuf_dynamic & (1u << k)));
     VkDescriptorBufferInfo direct;
     if (gw_ubo_direct(r.addr, size, &direct)) return direct;  // (written by a storing shader: read in place, see gw_note)
     if (stage == 1 && sdw_fix.s > 1 && sdw_patch(r.addr, size, &direct)) return direct;  // (texel size: see sdw_fix)
     if (stage == 0 && k == 3 && hud_patch(r.addr, size, &direct)) return direct;  // (a 16:9 HUD layer: see hud_patch)
+    if (ubo_direct(r.addr, size, &direct)) return direct;  // (in place: see ubo_direct_on)
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
@@ -3179,6 +3284,7 @@ static VkDescriptorBufferInfo gmem_info(void) {
 // Vertex / index data read in place from the imported guest heap (renderer.m bind_guest does the same with
 // g_guest_buffer): no per-draw copy, no index scan for the copy size. The game fences its CPU writes as on the
 // Switch. Falls back to copies outside the heap or without the import; SAVAGEWIND_VK_COPY_VERTICES=1 forces copies.
+static uint8_t gd_backed[HEAP_MAX >> 21];  // (PS4) the 2 MiB heap chunks known backed
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     static int copy = -1;
     if (copy < 0) copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
@@ -3186,7 +3292,14 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (!gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
 #ifdef __ORBIS__
-    plat_commit(addr, size);  // (PS4: the heap gets memory on first touch; a GPU read of a chunk without any faults the GPU)
+    // (PS4: the heap gets memory on first touch; a GPU read of a chunk without any faults the GPU.) The chunks found
+    // backed are remembered, one byte each: plat_commit ~4 times a draw was ~2% of the queue thread (a 16-entry cache
+    // of them thrashed: the buffers are all over the heap). Chunks stay backed until a reboot (vk_exec_reset).
+    uint64_t c0 = (addr - HEAP_BASE) >> 21, c1 = (addr + size - 1 - HEAP_BASE) >> 21;
+    if (!gd_backed[c0] || !gd_backed[c1]) {
+        plat_commit(addr, size);
+        for (uint64_t c = c0; c <= c1; c++) gd_backed[c] = 1;
+    }
 #endif
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
@@ -3276,6 +3389,23 @@ static bool gw_ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
     return true;
 }
 
+static void ubo_wait_gpu(void) {  // (what was recorded runs and finishes before UpdateUniformBuffer writes)
+    renderer_flush();
+    ubo_direct_used = false;
+}
+
+// A constant buffer read in place (ubo_direct_on), or false: copy it
+static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    if (!ubo_direct_on() || addr % g_vk.props.limits.minUniformBufferOffsetAlignment || uubs_overlaps(addr, addr + size))
+        return false;
+    VkBuffer b;
+    VkDeviceSize off;
+    if (!guest_direct(addr, size, &b, &off)) return false;
+    ubo_direct_used = true;
+    *out = (VkDescriptorBufferInfo){b, off, size};
+    return true;
+}
+
 static bool gw_ubo_copied(int stage, uint32_t cbuf_mask) {  // a constant buffer the stage reads would be copied from the set
     for (uint32_t m = cbuf_mask >> 3; m; m &= m - 1) {  // (cbuf k is bound slot k - 3)
         int i = __builtin_ctz(m);
@@ -3283,7 +3413,8 @@ static bool gw_ubo_copied(int stage, uint32_t cbuf_mask) {  // a constant buffer
         Range r = st.ubuf[stage][i];
         uint64_t size = r.size ? (r.size > 0x10000 ? 0x10000 : r.size) : 0x10000;
         VkDescriptorBufferInfo d;
-        if (r.addr && gw_overlaps(r.addr, r.addr + size) && !gw_ubo_direct(r.addr, size, &d)) return true;
+        if (r.addr && gw_overlaps(r.addr, r.addr + size) && !gw_ubo_direct(r.addr, size, &d) && !ubo_direct(r.addr, size, &d))
+            return true;
     }
     return false;
 }
@@ -3319,6 +3450,10 @@ void vk_exec_reset(void) {
     oq_nrun = oq_nreports = 0;  // (pending reports pointed at the old boot's memory)
     ngw = 0;
     nuub = 0;
+    nuubs = 0;
+    uubs_full = false;
+    uubs_gen++;
+    memset(gd_backed, 0, sizeof gd_backed);  // (the heap's memory went back to the system)
     guest_copy_flush();
     gw_lo = ~0ull;
     gw_hi = 0;
@@ -3468,8 +3603,6 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     VkDescriptorImageInfo ii[MAX_BIND];
     int n = 0;
     int sg = stage == 1 ? 1 : 0;
-    float rs[65][4] = {{1, 1, 0, 0}};
-    if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
         if (b->set != set) continue;
@@ -3511,6 +3644,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == 18) {
+            // (built here only: zeroing its 1 KB in every set was ~1% of the PS4's queue thread)
+            float rs[65][4] = {{1, 1, 0, 0}};
+            if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
         } else {
@@ -4036,7 +4172,12 @@ static void pso_init(void) {
     atomic_store(&pso_workers, n);
     atomic_store(&pso_running, true);
     LOG("[pso] pre-warm: %d pipelines on %d threads\n", pso_nrecs, n);
-    for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, pso_worker, NULL); }
+    int started = 0;
+    for (int i = 0; i < n; i++) { pthread_t t; if (pthread_create(&t, NULL, pso_worker, NULL) == 0) started++; }
+    // (the pre-warm ends when its last worker does: one that never started was waited for forever) Each missing
+    // worker runs here instead: the first helps with what's left, the others just count themselves done.
+    if (started < n) LOG("[pso] pre-warm: %d of %d threads started, the rest here\n", started, n);
+    for (int i = started; i < n; i++) pso_worker(NULL);
 }
 
 // device.c, once per frame presented: whether this frame waits for the pre-warm (it looks like gameplay and the
@@ -4274,7 +4415,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (pr && atomic_load(&pr->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) {
-        if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
+        if (st.rt.ncolor && trace_tex(st.rt.color[0]))
             vk_trace_event(st.rt.color[0], 2, NULL, 0, "draw skipped: program %s", pr ? "not compiled yet" : "missing");
         stat_skipped++;
         return;
@@ -4329,7 +4470,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     {   // (SAVAGEWIND_TRACE_TEX) a draw into a traced texture: its fragment shader and the textures it samples
         bool any = false;
-        for (int i = 0; i < st.rt.ncolor && i < 8 && !any; i++) any = vk_trace_tex(st.rt.color[i]);
+        for (int i = 0; i < st.rt.ncolor && i < 8 && !any; i++) any = trace_tex(st.rt.color[i]);
         if (any) {
             NvnTexture *srcs[16];
             int ns = 0;
@@ -4497,7 +4638,7 @@ static void draw_(CmdRec *r, bool indexed) {
 have_pipe:
     if (atomic_load(&pp->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pp->state);
     if (atomic_load(&pp->state) != 1) {
-        if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
+        if (st.rt.ncolor && trace_tex(st.rt.color[0]))
             vk_trace_event(st.rt.color[0], 3, NULL, 0, "draw skipped: pipeline %s", pp->state ? "failed" : "compiling");
         stat_skipped++;
         return;
@@ -4806,11 +4947,18 @@ have_pipe:
     cum_draws++;
     if (g_debug_frame) pick_after_draw();
     if (g_gpuprof_frame && gp_n) {
-        if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
-            size_t l = strlen(gp_label[gp_n - 1]);
-            snprintf(gp_label[gp_n - 1] + l, sizeof gp_label[0] - l, ", first fs %016llx", (unsigned long long)g_cur_fs_hash);
+        int row = gp_row;  // (the pass's row, past the draws' own)
+        if (!gp_draws[row]) {  // first draw of the row: its fragment shader hash
+            size_t l = strlen(gp_label[row]);
+            snprintf(gp_label[row] + l, sizeof gp_label[0] - l, ", first fs %016llx", (unsigned long long)g_cur_fs_hash);
         }
-        gp_draws[gp_n - 1]++;
+        gp_draws[row]++;
+        static int per_draw = -1;
+        if (per_draw < 0) per_draw = getenv("SAVAGEWIND_GPUPROF_DRAWS") != NULL;
+        if (per_draw)
+            gp_mark(cb, "draw %llu: vs %llx fs %016llx, %u %s x %u%s", (unsigned long long)stat_draws,
+                    (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)g_cur_fs_hash,
+                    use_index ? icount : count, use_index ? "indices" : "vertices", inst, pass_ncolor ? "" : " (depth only)");
     }
 }
 
@@ -5643,6 +5791,83 @@ static void debug_log_raw(TexBackend *b, const char *path) {
     LOG("[pass] %s: format %d %ux%u raw %s\n", path, b->format, b->width, b->height, hex);
 }
 
+// (debug frames, SAVAGEWIND_DEBUG_STATS) one colour target's level `lv`, layer `layer` (a 3D target's slice) per
+// channel: min / max / mean and NaN / Inf counts, decoded from its own format
+static float stats_half(uint32_t h) {
+    uint32_t e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? ldexpf((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | 1024), (int)e - 25);
+    return h & 0x8000 ? -v : v;
+}
+static float stats_ufloat(uint32_t v, int mb) {  // (the 11- and 10-bit floats of B10G11R11: 5 exponent bits, no sign)
+    uint32_t e = v >> mb, m = v & ((1u << mb) - 1);
+    return e == 0 ? ldexpf((float)m, -14 - mb) : e == 31 ? (m ? NAN : INFINITY) : ldexpf((float)(m | (1u << mb)), (int)e - 15 - mb);
+}
+static void debug_log_stats(NvnTexture *t, int pass, int slot, uint32_t lv, uint32_t layer) {
+    TexBackend *b = t->backend;
+    if (!b->image || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return;
+    enum { UN8, UN16, F16, F32, U32, R11G11B10, RGB10A2 } kind;
+    uint32_t nch;
+    switch (b->format) {
+    case VK_FORMAT_R8_UNORM: kind = UN8, nch = 1; break;
+    case VK_FORMAT_R8G8_UNORM: kind = UN8, nch = 2; break;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: kind = UN8, nch = 4; break;
+    case VK_FORMAT_R16_UNORM: kind = UN16, nch = 1; break;
+    case VK_FORMAT_R16G16_UNORM: kind = UN16, nch = 2; break;
+    case VK_FORMAT_R16G16B16A16_UNORM: kind = UN16, nch = 4; break;
+    case VK_FORMAT_R16_SFLOAT: kind = F16, nch = 1; break;
+    case VK_FORMAT_R16G16_SFLOAT: kind = F16, nch = 2; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: kind = F16, nch = 4; break;
+    case VK_FORMAT_R32_SFLOAT: kind = F32, nch = 1; break;
+    case VK_FORMAT_R32G32_SFLOAT: kind = F32, nch = 2; break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: kind = F32, nch = 4; break;
+    case VK_FORMAT_R32_UINT: kind = U32, nch = 1; break;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: kind = R11G11B10, nch = 3; break;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: kind = RGB10A2, nch = 4; break;
+    default: LOG("[stats] pass %03d c%d @%llx: format %d (not decoded)\n", pass, slot, (unsigned long long)t->addr, b->format); return;
+    }
+    uint32_t bpt = kind == UN8 ? nch : kind == UN16 || kind == F16 ? 2 * nch : kind == F32 ? 4 * nch : 4;
+    uint32_t w = level_extent(b->width, lv), h = level_extent(b->height, lv);
+    bool is3d = b->base_type == VK_IMAGE_VIEW_TYPE_3D;
+    uint64_t n = (uint64_t)w * h;
+    VkSpan out = vk_readback(n * bpt);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, is3d ? 0 : layer, 1},
+                           .imageOffset = {0, 0, is3d ? (int32_t)layer : 0}, .imageExtent = {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    vk_full_barrier(cb);
+    renderer_flush();
+    double mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, sum[4] = {0};
+    uint64_t nan = 0, inf = 0;
+    const uint8_t *p = out.ptr;
+    for (uint64_t i = 0; i < n; i++, p += bpt) {
+        float v[4];
+        uint32_t u;
+        for (uint32_t ch = 0; ch < nch; ch++) {
+            switch (kind) {
+            case UN8: v[ch] = p[ch] / 255.0f; break;
+            case UN16: v[ch] = ((const uint16_t *)p)[ch] / 65535.0f; break;
+            case F16: v[ch] = stats_half(((const uint16_t *)p)[ch]); break;
+            case F32: memcpy(&v[ch], p + 4 * ch, 4); break;
+            case U32: memcpy(&u, p, 4); v[ch] = (float)u; break;
+            case R11G11B10: memcpy(&u, p, 4); v[ch] = ch == 0 ? stats_ufloat(u & 0x7ff, 6) : ch == 1 ? stats_ufloat((u >> 11) & 0x7ff, 6) : stats_ufloat(u >> 22, 5); break;
+            case RGB10A2: memcpy(&u, p, 4); v[ch] = ch == 3 ? (u >> 30) / 3.0f : ((u >> (10 * ch)) & 1023) / 1023.0f; break;
+            }
+            if (isnan(v[ch])) { nan++; continue; }
+            if (isinf(v[ch])) { inf++; continue; }
+            if (v[ch] < mn[ch]) mn[ch] = v[ch];
+            if (v[ch] > mx[ch]) mx[ch] = v[ch];
+            sum[ch] += v[ch];
+        }
+    }
+    char line[400];
+    int k = snprintf(line, sizeof line, "[stats] pass %03d c%d @%llx f%#x vk%d %ux%u L%u Z%u:", pass, slot,
+                     (unsigned long long)t->addr, t->format, b->format, w, h, lv, layer);
+    for (uint32_t ch = 0; ch < nch && k < (int)sizeof line; ch++)
+        k += snprintf(line + k, sizeof line - k, " %c %.4g..%.4g m %.4g", "rgba"[ch], mn[ch], mx[ch], sum[ch] / (double)n);
+    LOG("%s | nan %llu inf %llu\n", line, (unsigned long long)nan, (unsigned long long)inf);
+}
+
 static void debug_save_channels(TexBackend *b, const char *path) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || b->base_type == VK_IMAGE_VIEW_TYPE_3D) return;
     VkFormat f = b->format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
@@ -6041,6 +6266,7 @@ static void exec_list(uint64_t handle, int depth) {
             stat_uub++;
             // The same bytes again (~1 update in 5 in the open world): the copies over the range stay good.
             if (!memcmp((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3])) { stat_uub_same++; break; }
+            uubs_note(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (copied from now on: see ubo_direct_on)
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
             uub_note(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (the shared copies over it are stale now)
             break;
@@ -6118,6 +6344,7 @@ void backend_execute(uint64_t handle) {
     PROF_T0();
     in_execute = true;
     guest_copy_flush();  // (a new list: the game may have written the memory of the last one's copies since)
+    ubo_direct_used = false;
     exec_list(handle, 0);
     in_execute = false;
     PROF_ADD(prof_exec);

@@ -48,6 +48,25 @@ ps4/package.sh 00.01
 A package built with the game code contains code made from your own copy of the game. It is yours alone: never share
 it.
 
+### Profile-guided optimization
+
+As TriAevum PS4 does it: an instrumented eboot records what runs while you play, and the next build lays out and
+inlines the runtime and the game code from that record. Both PGO builds compile the game code with clang -O2 without
+the vectorizers (`SW_GEN_OPT`; the plain build keeps -O1), each in its own tree.
+
+```sh
+PGO=generate SW_GENERATED=$PWD/generated ps4/build.sh   # 1. instrumented (build/savagewind-pgo-generate)
+PGO=generate ps4/package.sh 00.01                       #    play it: /data/savagewind/pgo/savagewind.profraw,
+                                                        #    rewritten every 30 s ("[pgo]" lines in the log)
+PS4_FTP=ftp://<console ip>:2121 ps4/pgo-merge.sh        # 2. -> $SW_PS4_BUILD/pgo/savagewind.profdata
+PGO=use SW_GENERATED=$PWD/generated ps4/build.sh        # 3. optimized (build/savagewind-pgo-use)
+PGO=use ps4/package.sh 00.01
+```
+
+The instrumented eboot is slower: play it where you want speed (the open world), not the menus. A profile goes stale
+as the runtime changes (the files that changed lose their part of it; the game code's stays good): collect again
+after big changes.
+
 ## On the console
 
 The package is installed with GoldHEN's package installer. Everything the title writes goes to `/data/savagewind/`:

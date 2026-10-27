@@ -281,6 +281,14 @@ void input_handle_event(const SDL_Event *e) {
         if (pad && !host_test && (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
                                   (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000)))
             last_device = DEVICE_PAD;
+        // both stick clicks: F9 on a pad (the PS4 has no keyboard), only with a debug switch that uses it set
+        if (pad && e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+            (e->gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK || e->gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) &&
+            SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK) && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK) &&
+            (getenv("SAVAGEWIND_DEBUG_STATS") || getenv("SAVAGEWIND_DEBUG_MAIN_ONLY") || getenv("SAVAGEWIND_DEBUG_FRAMES"))) {
+            LOG("[input] L3+R3: debug frame\n");
+            g_debug_frame_request = 1;
+        }
         recompute_pad();
         break;
     }

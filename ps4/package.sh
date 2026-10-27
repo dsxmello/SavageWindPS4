@@ -3,12 +3,12 @@
 # The package holds the eboot, the menu fonts and the icon: no game files and, unless the eboot was built with
 # SW_GENERATED, no game code. A package built with the game code is made from the player's own game files and is
 # theirs alone: never share it.
-#   package.sh [version XX.YY]
+#   [PGO=generate|use] package.sh [version XX.YY]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/env.sh"
 VERSION="${1:-00.01}"
-build="$SW_PS4_BUILD/build/savagewind"
+build="$SW_PS4_BUILD/build/savagewind${PGO:+-pgo-$PGO}"  # (PGO=generate|use: build.sh's PGO trees)
 eboot="$build/savagewind_eboot/eboot.bin"
 [ -f "$eboot" ] || { echo "no eboot: ps4/build.sh first" >&2; exit 1; }
 
