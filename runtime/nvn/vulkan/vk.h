@@ -164,3 +164,107 @@ VkShaderModule vk_builtin_shader(const char *name);  // internal shaders (clear,
 // ---- device / window (device.c)
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
 bool vk_replace_file(const char *tmp, const char *path);  // rename over an existing file, atomically
+
+// ---- command recording on a thread of its own (vkrec.c): the backend's vkCmd* calls go through vr_Cmd*
+bool vr_enabled(void);
+void vr_sync(void);  // until every command put has been recorded
+#define CB_ VkCommandBuffer cb
+void vr_CmdBindPipeline(CB_, VkPipelineBindPoint bp, VkPipeline p);
+void vr_CmdSetViewport(CB_, uint32_t first, uint32_t n, const VkViewport *v);
+void vr_CmdSetScissor(CB_, uint32_t first, uint32_t n, const VkRect2D *r);
+void vr_CmdBindDescriptorSets(CB_, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const VkDescriptorSet *s,
+                              uint32_t ndyn, const uint32_t *dyn);
+void vr_CmdPipelineBarrier2(CB_, const VkDependencyInfo *d);
+void vr_CmdCopyBufferToImage(CB_, VkBuffer buf, VkImage img, VkImageLayout lay, uint32_t n, const VkBufferImageCopy *r);
+void vr_CmdCopyImageToBuffer(CB_, VkImage img, VkImageLayout lay, VkBuffer buf, uint32_t n, const VkBufferImageCopy *r);
+void vr_CmdEndRendering(CB_);
+void vr_CmdDraw(CB_, uint32_t nv, uint32_t ni, uint32_t fv, uint32_t fi);
+void vr_CmdDrawIndexed(CB_, uint32_t n, uint32_t inst, uint32_t first, int32_t vofs, uint32_t finst);
+void vr_CmdBeginRendering(CB_, const VkRenderingInfo *ri);
+void vr_CmdPushConstants(CB_, VkPipelineLayout l, VkShaderStageFlags st, uint32_t off, uint32_t size, const void *data);
+void vr_CmdWriteTimestamp2(CB_, VkPipelineStageFlags2 st, VkQueryPool qp, uint32_t q);
+void vr_CmdSetStencilWriteMask(CB_, VkStencilFaceFlags f, uint32_t m);
+void vr_CmdSetStencilCompareMask(CB_, VkStencilFaceFlags f, uint32_t m);
+void vr_CmdSetStencilReference(CB_, VkStencilFaceFlags f, uint32_t r);
+void vr_CmdSetStencilTestEnable(CB_, VkBool32 b);
+void vr_CmdSetStencilOp(CB_, VkStencilFaceFlags f, VkStencilOp fail, VkStencilOp pass, VkStencilOp dfail, VkCompareOp cmp);
+void vr_CmdSetDepthWriteEnable(CB_, VkBool32 b);
+void vr_CmdSetDepthTestEnable(CB_, VkBool32 b);
+void vr_CmdSetPrimitiveTopology(CB_, VkPrimitiveTopology t);
+void vr_CmdSetPrimitiveRestartEnable(CB_, VkBool32 b);
+void vr_CmdSetLineWidth(CB_, float w);
+void vr_CmdSetFrontFace(CB_, VkFrontFace f);
+void vr_CmdSetDepthCompareOp(CB_, VkCompareOp op);
+void vr_CmdSetDepthBiasEnable(CB_, VkBool32 b);
+void vr_CmdSetDepthBias(CB_, float c, float cl, float s);
+void vr_CmdSetCullMode(CB_, VkCullModeFlags m);
+void vr_CmdSetBlendConstants(CB_, const float k[4]);
+void vr_CmdDispatch(CB_, uint32_t x, uint32_t y, uint32_t z);
+void vr_CmdResetQueryPool(CB_, VkQueryPool qp, uint32_t first, uint32_t n);
+void vr_CmdBeginQuery(CB_, VkQueryPool qp, uint32_t q, VkQueryControlFlags f);
+void vr_CmdEndQuery(CB_, VkQueryPool qp, uint32_t q);
+void vr_CmdCopyImage(CB_, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r);
+void vr_CmdBlitImage(CB_, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter f);
+void vr_CmdResolveImage(CB_, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageResolve *r);
+void vr_CmdClearColorImage(CB_, VkImage img, VkImageLayout lay, const VkClearColorValue *v, uint32_t n, const VkImageSubresourceRange *r);
+void vr_CmdClearDepthStencilImage(CB_, VkImage img, VkImageLayout lay, const VkClearDepthStencilValue *v, uint32_t n,
+                                  const VkImageSubresourceRange *r);
+void vr_CmdClearAttachments(CB_, uint32_t na, const VkClearAttachment *at, uint32_t nr, const VkClearRect *r);
+void vr_CmdBindVertexBuffers(CB_, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o);
+void vr_CmdBindIndexBuffer(CB_, VkBuffer b, VkDeviceSize o, VkIndexType t);
+#undef CB_
+VkResult vr_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi);
+VkResult vr_EndCommandBuffer(VkCommandBuffer cb);
+VkResult vr_AllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *cb);
+VkResult vr_QueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence f);
+VkResult vr_QueueWaitIdle(VkQueue q);
+VkResult vr_DeviceWaitIdle(VkDevice d);
+#ifndef VKREC_IMPL
+#define vkCmdBindPipeline vr_CmdBindPipeline
+#define vkCmdSetViewport vr_CmdSetViewport
+#define vkCmdSetScissor vr_CmdSetScissor
+#define vkCmdBindDescriptorSets vr_CmdBindDescriptorSets
+#define vkCmdPipelineBarrier2 vr_CmdPipelineBarrier2
+#define vkCmdCopyBufferToImage vr_CmdCopyBufferToImage
+#define vkCmdCopyImageToBuffer vr_CmdCopyImageToBuffer
+#define vkCmdEndRendering vr_CmdEndRendering
+#define vkCmdDraw vr_CmdDraw
+#define vkCmdDrawIndexed vr_CmdDrawIndexed
+#define vkCmdBeginRendering vr_CmdBeginRendering
+#define vkCmdPushConstants vr_CmdPushConstants
+#define vkCmdWriteTimestamp2 vr_CmdWriteTimestamp2
+#define vkCmdSetStencilWriteMask vr_CmdSetStencilWriteMask
+#define vkCmdSetStencilCompareMask vr_CmdSetStencilCompareMask
+#define vkCmdSetStencilReference vr_CmdSetStencilReference
+#define vkCmdSetStencilTestEnable vr_CmdSetStencilTestEnable
+#define vkCmdSetStencilOp vr_CmdSetStencilOp
+#define vkCmdSetDepthWriteEnable vr_CmdSetDepthWriteEnable
+#define vkCmdSetDepthTestEnable vr_CmdSetDepthTestEnable
+#define vkCmdSetPrimitiveTopology vr_CmdSetPrimitiveTopology
+#define vkCmdSetPrimitiveRestartEnable vr_CmdSetPrimitiveRestartEnable
+#define vkCmdSetLineWidth vr_CmdSetLineWidth
+#define vkCmdSetFrontFace vr_CmdSetFrontFace
+#define vkCmdSetDepthCompareOp vr_CmdSetDepthCompareOp
+#define vkCmdSetDepthBiasEnable vr_CmdSetDepthBiasEnable
+#define vkCmdSetDepthBias vr_CmdSetDepthBias
+#define vkCmdSetCullMode vr_CmdSetCullMode
+#define vkCmdSetBlendConstants vr_CmdSetBlendConstants
+#define vkCmdDispatch vr_CmdDispatch
+#define vkCmdResetQueryPool vr_CmdResetQueryPool
+#define vkCmdBeginQuery vr_CmdBeginQuery
+#define vkCmdEndQuery vr_CmdEndQuery
+#define vkCmdCopyImage vr_CmdCopyImage
+#define vkCmdBlitImage vr_CmdBlitImage
+#define vkCmdResolveImage vr_CmdResolveImage
+#define vkCmdClearColorImage vr_CmdClearColorImage
+#define vkCmdClearDepthStencilImage vr_CmdClearDepthStencilImage
+#define vkCmdClearAttachments vr_CmdClearAttachments
+#define vkCmdBindVertexBuffers vr_CmdBindVertexBuffers
+#define vkCmdBindIndexBuffer vr_CmdBindIndexBuffer
+#define vkBeginCommandBuffer vr_BeginCommandBuffer
+#define vkEndCommandBuffer vr_EndCommandBuffer
+#define vkAllocateCommandBuffers vr_AllocateCommandBuffers
+#define vkQueueSubmit2 vr_QueueSubmit2
+#define vkQueueWaitIdle vr_QueueWaitIdle
+#define vkDeviceWaitIdle vr_DeviceWaitIdle
+#endif

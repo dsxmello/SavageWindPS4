@@ -1153,7 +1153,7 @@ void vk_frame_resume(void) {
 }
 
 VkExtent2D vk_frame_extent(void) { return g_vk.sc_extent; }
-void *vk_frame_cmd(void) { return (void *)vk_cmd(); }
+void *vk_frame_cmd(void) { VkCommandBuffer cb = vk_cmd(); vr_sync(); return (void *)cb; }  // (recorded into directly: vkrec.c)
 
 static void save_window_image(VkCommandBuffer cb, VkSpan *out) {
     uint32_t w = g_vk.sc_extent.width, h = g_vk.sc_extent.height;
@@ -1311,6 +1311,7 @@ static void present_locked(NvnTexture *t) {
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("SAVAGEWIND_MENU_AT") ? atol(getenv("SAVAGEWIND_MENU_AT")) : 0;
         if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
+        vr_sync();  // (ImGui records into cb itself: after the commands put before it, vkrec.c)
         menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
         g_present_split[2] += SDL_GetTicksNS() - td;
         static long win_shot = -1;

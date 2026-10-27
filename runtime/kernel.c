@@ -153,7 +153,9 @@ static void core_acquire(KThread *t) {
     t->core_ticket = k->next_ticket++;
     if (k->nwaiting < 64) k->waiting[k->nwaiting++] = t;
     core_best_update(k);
+    uint64_t w0 = (k->owner || !core_next(k, t)) ? plat_now_ns() : 0;
     while ((k->owner || !core_next(k, t)) && !g_rt_unwind) pthread_cond_wait(&k->cv, &k->m);
+    if (w0) __atomic_fetch_add(&t->core_wait_ns, plat_now_ns() - w0, __ATOMIC_RELAXED);
     for (int i = 0; i < k->nwaiting; i++)
         if (k->waiting[i] == t) { k->waiting[i] = k->waiting[--k->nwaiting]; break; }
     core_best_update(k);
@@ -357,6 +359,25 @@ void kernel_sample_host_thread(void) {
     if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
     pthread_mutex_unlock(&g_klock);
 }
+// (measuring) Whether the guest's threads wait for the four cores' tokens (more threads of one core ready to run than
+// it runs) rather than for each other: per thread that waited, the time since the last line, and the core
+void kernel_log_core_waits(void) {
+    static uint64_t last;
+    uint64_t now = plat_now_ns(), span = last ? now - last : 0;
+    last = now;
+    if (!span || !cores_on()) return;
+    char line[1024];
+    int n = snprintf(line, sizeof line, "[cores] waited for a core over %.0f s:", span / 1e9);
+    pthread_mutex_lock(&g_klock);
+    for (KThread *t = g_threads; t && n < (int)sizeof line - 40; t = t->anext) {
+        uint64_t w = __atomic_exchange_n(&t->core_wait_ns, 0, __ATOMIC_RELAXED);
+        if (t->finished || w * 200 < span) continue;  // (under 0.5%)
+        n += snprintf(line + n, sizeof line - n, " h%x c%d %.1f%%", t->handle, t->core & 3, 100.0 * (double)w / (double)span);
+    }
+    pthread_mutex_unlock(&g_klock);
+    LOG("%s\n", line);
+}
+
 void kernel_dump_threads(const char *why) {
     static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
     LOG("[hang] %s: threads (svc = the syscall it is in, core = held / wanted)\n", why);

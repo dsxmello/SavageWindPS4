@@ -42,7 +42,7 @@ constexpr int kRipIndex = 20, kRspIndex = 23;
 // function that called into them: the first eboot code address on the stack, tagged.
 constexpr uint64_t kSystemLibs = 0x800000000ULL, kCallerTag = 1ULL << 62;
 constexpr uintptr_t kTextWindow = 0x10000000;  // (Savage Wind: ~250 MB of text with the game code)
-constexpr int kMaxThreads = 32;  // (Savage Wind: the queue, the translator and the first guest threads)
+constexpr int kMaxThreads = 40;  // (Savage Wind: the queue, vkrec, the translator and the first guest threads)
 constexpr int kMaxSamples = 10240;  // per thread and window (10 s at 1 kHz fits; Savage Wind: 32 threads in .bss)
 
 struct ThreadSamples {
@@ -601,7 +601,8 @@ extern "C" double ps4_thread_cpu_seconds(int slot) {
 extern "C" void ps4_sampler_register_thread(const char* name) {
     ps4_watch_thread(name);
     const int index = g_thread_count.load();
-    if (index >= kMaxThreads)
+    // (Savage Wind: the last 4 places stay for host threads made later, as vkrec: guest threads fill the rest)
+    if (index >= kMaxThreads || (index >= kMaxThreads - 4 && name && !strncmp(name, "guest", 5)))
         return;
     g_threads[index].name = name;
     g_threads[index].thread.store(pthread_self());

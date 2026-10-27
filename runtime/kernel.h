@@ -42,6 +42,7 @@ struct KThread {
     int core_held;
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
+    uint64_t core_wait_ns;  // (measuring) time spent waiting for its core's token (kernel_log_core_waits)
     // (hang dumps, kernel_dump_threads) the syscall it is in (-1: none) and the guest lr at it
     volatile int svc_now;
     volatile uint64_t svc_lr;
@@ -71,6 +72,7 @@ void kernel_signal(KObject *o);  // caller holds g_klock
 void kernel_watch_write(const char *what, uint64_t addr, uint64_t len);
 KEvent *kernel_create_event_pair(uint32_t *writable, uint32_t *readable);
 KThread *kernel_current_thread(void);
+void kernel_log_core_waits(void);  // (measuring) a "[cores]" line: each busy thread's wait for its core since the last one
 void kernel_thread_off_cores(void);  // the current thread stops taking part in core scheduling (runtime/kernel.c)
 void kernel_sleep_until_ns(uint64_t t);  // host code on a guest thread waits until t (plat_now_ns), its core let go
 // host work on a guest thread that runs no guest code (the GPU backend: translating command lists, presenting, waiting

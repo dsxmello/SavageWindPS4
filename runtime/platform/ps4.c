@@ -304,6 +304,7 @@ static void load_system_modules(void) {
 // Hang watchdog: the log stays the same size for 10 s -> every guest thread's state to it (kernel_dump_threads), at
 // most 5 times, 30 s apart. The console has no debugger to attach; this shows what each thread waits in.
 void kernel_dump_threads(const char *why);
+void kernel_log_core_waits(void);
 // Where the console's direct memory went: the guest's, the host stacks', RADV's buffers and images, and what's left
 // (the largest free 2 MiB-aligned block: a guest chunk needs one)
 static void log_memory(const char *why) {
@@ -335,7 +336,7 @@ static void *hang_watch(void *arg) {
         if (fstat(2, &st) != 0) continue;
         if (st.st_size != last) {
             static unsigned secs;
-            if (++secs % 30 == 0) { log_memory(""); fstat(2, &st); }  // (only while the log moves: hangs stay quiet)
+            if (++secs % 30 == 0) { log_memory(""); kernel_log_core_waits(); fstat(2, &st); }  // (only while the log moves: hangs stay quiet)
             last = st.st_size; still = 0; wait = 10;
             continue;
         }
