@@ -626,12 +626,13 @@ static void waitlist_remove(KThread *t) {
 // A blocking wait first spins a little (its core let go) for the waker: most of BOTW's waits are short (the main thread
 // waits thousands of times a second for its workers' mutexes, condition variables and addresses), and going to sleep
 // and being woken by the host scheduler cost the PS4 tens of microseconds each. Returns whether the wait ended while
-// spinning. g_klock held on entry and return. SAVAGEWIND_SPIN_US=<us> (PS4 default 50, elsewhere 0: off).
+// spinning. g_klock held on entry and return. SAVAGEWIND_SPIN_US=<us> (PS4 default 150, elsewhere 0: off). Open world on
+// the PS4, heavy scenes: no spin 20.9 fps, 50 us 22.6, 150 us 23.6 (main thread asleep 41% -> 35% -> 31%).
 static bool block_spin(KThread *t, int64_t timeout_ns) {
     static int64_t spin_ns = -1;
     if (spin_ns < 0) {
 #ifdef __ORBIS__
-        spin_ns = 50000;
+        spin_ns = 150000;
 #else
         spin_ns = 0;
 #endif
