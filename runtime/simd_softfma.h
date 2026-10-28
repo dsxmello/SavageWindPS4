@@ -196,6 +196,20 @@ __attribute__((noinline)) static float simd_soft_fma_s(float x, float y, float z
     memcpy(&ux, &x, 4), memcpy(&uy, &y, 4), memcpy(&uz, &z, 4);
     // (exponent field neither 0 nor 255: (field - 1) < 254, unsigned)
     int normal = (((ux >> 23) & 0xff) - 1u < 254u) & (((uy >> 23) & 0xff) - 1u < 254u) & (((uz >> 23) & 0xff) - 1u < 254u);
+    if (__builtin_expect(!normal && !sfma_rc, 0)) {
+        // Zeros with normal operands (~half the calls in a shrine: vectors and matrices with zero components): 0*y + z
+        // is z (or a signed zero) exactly, x*y + 0 the product rounded once, as the FMA instructions give them
+        uint32_t ax = ux & 0x7fffffffu, ay = uy & 0x7fffffffu, az = uz & 0x7fffffffu;
+        int nx = ((ux >> 23) & 0xff) - 1u < 254u, ny = ((uy >> 23) & 0xff) - 1u < 254u, nz = ((uz >> 23) & 0xff) - 1u < 254u;
+        if ((!ax || nx) && (!ay || ny) && (!az || nz)) {
+            volatile float vx = x, vy = y, vz = z;  // (the host's own multiply and add: its rounding, FTZ and signs)
+            if (!ax || !ay) {
+                volatile float p = vx * vy;
+                return p + vz;
+            }
+            return vx * vy;  // (z is a zero: x*y nonzero, so its sign wins)
+        }
+    }
     if (__builtin_expect(normal && !sfma_rc, 1)) {
         double p = (double)x * (double)y;  // (two statements: never contracted into an FMA where there is one)
         double s = p + (double)z;
