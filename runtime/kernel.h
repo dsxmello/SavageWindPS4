@@ -43,10 +43,20 @@ struct KThread {
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
     uint64_t core_wait_ns;  // (measuring) time spent waiting for its core's token (kernel_log_core_waits)
+    // (measuring) of those waits, how many, and the time of the ones that began with a worse (higher prio number)
+    // thread holding the core: preemption latency, not a core too busy
+    uint32_t core_waits;
+    uint64_t core_wait_worse_ns;
     // (measuring) its blocking waits (block_current) since the last "[blocks]" line: count by length (<20 us, <50 us,
     // <200 us, <1 ms, longer), total time, and how many ended while it spun (block_spin)
     uint32_t blk_hist[5], blk_spun;
     uint64_t blk_ns;
+    // (measuring) who ended its waits ("[waitfor]"): the last thread that woke it (0: none, a timeout or cancel), and
+    // per waker and kind of wait the time and count since the last line; for mutex waits ended by the owner it had at
+    // the start, the part of the wait that owner spent waiting for its core (core_wait_all: never reset)
+    uint32_t woken_by;
+    uint64_t core_wait_all;
+    struct { uint32_t waker; uint8_t kind; uint32_t n; uint64_t ns, starved_ns; } wf[8];
     // (hang dumps, kernel_dump_threads) the syscall it is in (-1: none) and the guest lr at it
     volatile int svc_now;
     volatile uint64_t svc_lr;

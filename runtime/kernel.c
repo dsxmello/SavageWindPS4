@@ -65,7 +65,10 @@ static void handle_close(uint32_t h) {
 // Threads blocked in WaitSynchronization; object signals wake only these (caller holds g_klock).
 static KThread *g_syncwaiters;
 
-static void wake(KThread *t) { pthread_cond_signal(&t->cond); }
+static void wake(KThread *t) {
+    t->woken_by = t_cur ? t_cur->handle : 0;
+    pthread_cond_signal(&t->cond);
+}
 
 void kernel_signal(KObject *o) {
     // caller holds g_klock
@@ -154,8 +157,15 @@ static void core_acquire(KThread *t) {
     if (k->nwaiting < 64) k->waiting[k->nwaiting++] = t;
     core_best_update(k);
     uint64_t w0 = (k->owner || !core_next(k, t)) ? plat_now_ns() : 0;
+    bool behind_worse = k->owner && k->owner->prio > t->prio;
     while ((k->owner || !core_next(k, t)) && !g_rt_unwind) pthread_cond_wait(&k->cv, &k->m);
-    if (w0) __atomic_fetch_add(&t->core_wait_ns, plat_now_ns() - w0, __ATOMIC_RELAXED);
+    if (w0) {
+        uint64_t w = plat_now_ns() - w0;
+        __atomic_fetch_add(&t->core_wait_ns, w, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&t->core_wait_all, w, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&t->core_waits, 1, __ATOMIC_RELAXED);
+        if (behind_worse) __atomic_fetch_add(&t->core_wait_worse_ns, w, __ATOMIC_RELAXED);
+    }
     for (int i = 0; i < k->nwaiting; i++)
         if (k->waiting[i] == t) { k->waiting[i] = k->waiting[--k->nwaiting]; break; }
     core_best_update(k);
@@ -369,22 +379,52 @@ void kernel_log_core_waits(void) {
     uint64_t now = plat_now_ns(), span = last ? now - last : 0;
     last = now;
     if (!span || !cores_on()) return;
-    char line[1024];
+    char line[3072];
     int n = snprintf(line, sizeof line, "[cores] waited for a core over %.0f s:", span / 1e9);
     pthread_mutex_lock(&g_klock);
-    for (KThread *t = g_threads; t && n < (int)sizeof line - 40; t = t->anext) {
+    for (KThread *t = g_threads; t && n < (int)sizeof line - 80; t = t->anext) {
         uint64_t w = __atomic_exchange_n(&t->core_wait_ns, 0, __ATOMIC_RELAXED);
+        uint64_t ww = __atomic_exchange_n(&t->core_wait_worse_ns, 0, __ATOMIC_RELAXED);
+        uint32_t nw = __atomic_exchange_n(&t->core_waits, 0, __ATOMIC_RELAXED);
         if (t->finished || w * 200 < span) continue;  // (under 0.5%)
-        n += snprintf(line + n, sizeof line - n, " h%x c%d %.1f%%", t->handle, t->core & 3, 100.0 * (double)w / (double)span);
+        n += snprintf(line + n, sizeof line - n, " h%x c%d %.1f%% (%u, %.1f%% behind worse)", t->handle, t->core & 3,
+                      100.0 * (double)w / (double)span, nw, 100.0 * (double)ww / (double)span);
     }
     // [blocks]: the threads that spent over 5% of the time blocked
     char bl[4096];
     int m = snprintf(bl, sizeof bl, "[blocks] waits by length (<20us <50us <200us <1ms longer; spun; %% of the time):");
-    for (KThread *t = g_threads; t && m < (int)sizeof bl - 80; t = t->anext) {
+    // [waitfor]: for those, the threads that ended their waits (kind m mutex, c condvar, a arbiter; "-": none, a
+    // timeout; "+": the rest) with the time, the count and, for mutexes, the owner's time waiting for its core
+    static char wf[64][640];
+    int nwf = 0;
+    for (KThread *t = g_threads; t; t = t->anext) {
         uint64_t ns = t->blk_ns;
-        if (!t->finished && ns * 20 >= span)
+        if (!t->finished && ns * 20 >= span && m < (int)sizeof bl - 80)
             m += snprintf(bl + m, sizeof bl - m, " h%x %u/%u/%u/%u/%u spun %u %.0f%%", t->handle, t->blk_hist[0], t->blk_hist[1],
                           t->blk_hist[2], t->blk_hist[3], t->blk_hist[4], t->blk_spun, 100.0 * (double)ns / (double)span);
+        if (!t->finished && ns * 20 >= span && nwf < 64) {
+            char *s = wf[nwf++];
+            int k = snprintf(s, sizeof wf[0], "[waitfor] h%x (prio %d, core %d) blocked %.1f%%:", t->handle, t->base_prio,
+                             t->core & 3, 100.0 * (double)ns / (double)span);
+            int nslots = sizeof t->wf / sizeof t->wf[0];
+            for (int pass = 0; pass < nslots && k < (int)sizeof wf[0] - 64; pass++) {  // (largest first)
+                int best = -1;
+                for (int i = 0; i < nslots; i++)
+                    if (t->wf[i].n && (best < 0 || t->wf[i].ns > t->wf[best].ns)) best = i;
+                if (best < 0) break;
+                char who[12];
+                uint32_t w = t->wf[best].waker;
+                if (w == 0xffffffff) snprintf(who, sizeof who, "+");
+                else if (!w) snprintf(who, sizeof who, "-");
+                else snprintf(who, sizeof who, "h%x", w);
+                k += snprintf(s + k, sizeof wf[0] - k, " %s %c %.1f%% (%u)", who, " mca"[t->wf[best].kind & 3],
+                              100.0 * (double)t->wf[best].ns / (double)span, t->wf[best].n);
+                if (t->wf[best].starved_ns)
+                    k += snprintf(s + k, sizeof wf[0] - k, " starved %.1f%%", 100.0 * (double)t->wf[best].starved_ns / (double)span);
+                t->wf[best].n = 0;
+            }
+        }
+        memset(t->wf, 0, sizeof t->wf);
         memset(t->blk_hist, 0, sizeof t->blk_hist);
         t->blk_spun = 0;
         t->blk_ns = 0;
@@ -392,6 +432,7 @@ void kernel_log_core_waits(void) {
     pthread_mutex_unlock(&g_klock);
     LOG("%s\n", line);
     LOG("%s\n", bl);
+    for (int i = 0; i < nwf; i++) LOG("%s\n", wf[i]);
 }
 
 void kernel_dump_threads(const char *why) {
@@ -668,6 +709,10 @@ static uint32_t block_current(int64_t timeout_ns) {
     uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     uint64_t blk_t0 = plat_now_ns();
+    KObject *own = kind == WAIT_MUTEX ? handle_get(mutex_owner(t->wait_addr)) : NULL;
+    KThread *owner = own && own->type == KOBJ_THREAD ? (KThread *)own : NULL;
+    uint64_t owner_cw0 = owner ? __atomic_load_n(&owner->core_wait_all, __ATOMIC_RELAXED) : 0;
+    t->woken_by = 0;
     waitlist_add(t);
     if (block_spin(t, timeout_ns)) t->blk_spun++;
     while (t->wait_kind != WAIT_NONE) {
@@ -702,6 +747,17 @@ static uint32_t block_current(int64_t timeout_ns) {
         uint64_t d = plat_now_ns() - blk_t0;
         t->blk_hist[d < 20000 ? 0 : d < 50000 ? 1 : d < 200000 ? 2 : d < 1000000 ? 3 : 4]++;
         t->blk_ns += d;
+        uint32_t by = t->woken_by;
+        uint64_t starved = 0;
+        if (owner && by == owner->handle) {
+            starved = __atomic_load_n(&owner->core_wait_all, __ATOMIC_RELAXED) - owner_cw0;
+            if (starved > d) starved = d;
+        }
+        int i = 0, last = sizeof t->wf / sizeof t->wf[0] - 1;  // (the last slot: every other waker)
+        while (i < last && t->wf[i].n && !(t->wf[i].waker == by && t->wf[i].kind == kind)) i++;
+        if (!t->wf[i].n) t->wf[i].waker = by, t->wf[i].kind = (uint8_t)kind;
+        else if (i == last && !(t->wf[i].waker == by && t->wf[i].kind == kind)) t->wf[i].waker = 0xffffffff;
+        t->wf[i].n++, t->wf[i].ns += d, t->wf[i].starved_ns += starved;
     }
     // (integers only: on the PS4 this runs on a stack generated code left unaligned, and printf's floats (SSE spills)
     // faulted there)
