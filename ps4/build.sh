@@ -14,8 +14,9 @@ mkdir -p "$SW_PS4_BUILD"/{src,build,downloads,out}
     git clone -q --depth 1 --branch vulkan-sdk-1.4.335.0 https://github.com/zeux/volk "$SW_PS4_BUILD/src/volk"
 
 # PGO=generate builds the instrumented eboot in its own tree, PGO=use (PGO_PROFILE=<merged .profdata>, default
-# $SW_PS4_BUILD/pgo/savagewind.profdata: ps4/pgo-merge.sh) the optimized one; both give the game code clang -O2
-# without the vectorizers (SW_GEN_OPT; the plain build keeps the Makefile's -O1). package.sh takes the same PGO=.
+# $SW_PS4_BUILD/pgo/savagewind.profdata: ps4/pgo-merge.sh) the optimized one. Every build gives the game code clang -O2
+# without the vectorizers (SW_GEN_OPT=<flags> for others, e.g. the Makefile's -O1), so a plain build differs from a
+# PGO one by the profile alone. package.sh takes the same PGO=.
 PGO="${PGO:-}"
 build="$SW_PS4_BUILD/build/savagewind${PGO:+-pgo-$PGO}"
 pgo_args=()
@@ -25,7 +26,7 @@ case "$PGO" in
     use) pgo_args=(-DSW_PGO=use -DSW_PGO_PROFILE="${PGO_PROFILE:-$SW_PS4_BUILD/pgo/savagewind.profdata}") ;;
     *) echo "PGO must be generate, use or empty" >&2; exit 1 ;;
 esac
-[ -n "$PGO" ] && pgo_args+=(-DSW_GEN_OPT="${SW_GEN_OPT:--O2 -fno-vectorize -fno-slp-vectorize}")
+pgo_args+=(-DSW_GEN_OPT="${SW_GEN_OPT:--O2 -fno-vectorize -fno-slp-vectorize}")
 [ "${1:-}" = clean ] && rm -rf "$build"
 if [ ! -f "$build/CMakeCache.txt" ]; then
     env -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u LIBS \
