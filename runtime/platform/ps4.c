@@ -38,6 +38,8 @@ int32_t sceSystemServiceLoadExec(const char *path, const char *args[]);
 int32_t sceSystemServiceHideSplashScreen(void);
 void *scePthreadSelf(void);
 int scePthreadSetprio(void *thread, int prio);
+int scePthreadSetaffinity(void *thread, uint64_t mask);
+int scePthreadGetaffinity(void *thread, uint64_t *mask);
 uint64_t sceKernelGetTscFrequency(void);
 int32_t sceKernelAvailableDirectMemorySize(off_t search_start, off_t search_end, size_t alignment, off_t *physical_out,
                                            size_t *size_out);
@@ -192,7 +194,43 @@ static uint64_t stack_used_max(bool guest) {
 // pipeline pre-warm worker never started, scePthreadCreate 0x80020023, and the pre-warm waited for it forever). Those
 // created without a stack of their own get one in direct memory, 2 MiB or the size they asked for (SDL's), and keep
 // their detach state (ps4/CMakeLists.txt: --wrap=pthread_create).
+// Which CPUs the threads run on. The game gets CPUs 0-6 of the eight (two clusters of four, an L2 each). The queue
+// thread (NVN -> Vulkan) has CPU 4 and vkrec CPU 5 to themselves: the guest threads run on the others (0-3, 6), so
+// the translation never preempts the game's threads, and the host's other threads (RADV's, SDL's, the pipeline
+// workers') anywhere, as before (a new thread inherits its creator's CPUs: host_thread_start resets them).
+// Never one CPU per Switch core: in 0.48 a guest thread spinning in guest code (holding its core) kept a woken,
+// better thread of that core, pinned to the same CPU, from ever running again (the system doesn't time-slice them:
+// the line below logs the policy), so the better one never took the core back and the game hung at Continue. SAVAGEWIND_PS4_PIN=0: no pinning (the system places every thread, as before).
+void plat_log(const char *fmt, ...);
+static uint64_t g_cpus;  // the CPUs the process may use (0: pinning off)
+static pthread_once_t g_pin_once = PTHREAD_ONCE_INIT;
+static void pin_init(void) {
+    const char *e = getenv("SAVAGEWIND_PS4_PIN");
+    uint64_t m = 0;
+    int r = scePthreadGetaffinity(scePthreadSelf(), &m), pol = -1;
+    struct sched_param sp = {0};
+    pthread_getschedparam(pthread_self(), &pol, &sp);
+    if (!(e && !strcmp(e, "0")) && r == 0 && (m & 0x7f) == 0x7f) g_cpus = m;
+    plat_log("[plat] cpus 0x%llx (result 0x%x), policy %d prio %d: pinning %s\n", (unsigned long long)m, r, pol,
+             sp.sched_priority, g_cpus ? "on" : "off");
+}
+// role: 0 a guest thread, 1 the queue thread, 2 vkrec, -1 any other host thread
+void ps4_pin_thread(int role) {
+    pthread_once(&g_pin_once, pin_init);
+    if (!g_cpus) return;
+    uint64_t mask = role == 1 ? 1ull << 4 : role == 2 ? 1ull << 5 : role == 0 ? g_cpus & ~0x30ull : g_cpus;
+    int r = scePthreadSetaffinity(scePthreadSelf(), mask);
+    if (r) plat_log("[plat] scePthreadSetaffinity 0x%llx: 0x%x\n", (unsigned long long)mask, r);
+}
+
 #define HOST_THREAD_STACK (2ull << 20)
+typedef struct { void *(*fn)(void *); void *arg; } HostStart;
+static void *host_thread_start(void *a) {
+    HostStart s = *(HostStart *)a;
+    free(a);
+    ps4_pin_thread(-1);
+    return s.fn(s.arg);
+}
 int __real_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg);
 int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg) {
     size_t size = HOST_THREAD_STACK, asked = 0;
@@ -204,8 +242,15 @@ int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(
         if (pthread_attr_getstacksize(attr, &asked) == 0 && asked > size) size = asked;
         pthread_attr_getdetachstate(attr, &detach);
     }
+    pthread_once(&g_pin_once, pin_init);
+    HostStart *hs = g_cpus ? malloc(sizeof *hs) : NULL;
+    if (hs) hs->fn = fn, hs->arg = arg, fn = host_thread_start, arg = hs;
     void *stack = alloc_stack(size, "thread");
-    if (!stack) return __real_pthread_create(t, attr, fn, arg);
+    if (!stack) {
+        int r = __real_pthread_create(t, attr, fn, arg);
+        if (r && hs) free(hs);
+        return r;
+    }
     size = (size + CHUNK - 1) & ~(CHUNK - 1);
     pthread_attr_t a;
     pthread_attr_init(&a);
@@ -213,6 +258,7 @@ int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(
     pthread_attr_setstack(&a, stack, size);
     int r = __real_pthread_create(t, &a, fn, arg);
     pthread_attr_destroy(&a);
+    if (r && hs) free(hs);
     return r;
 }
 
@@ -379,6 +425,8 @@ static int sampling(void) {
     return on;
 }
 void ps4_profile_thread(const char *name) {
+    if (!strcmp(name, "queue")) ps4_pin_thread(1);  // (see ps4_pin_thread; guest threads: kernel.c thread_main)
+    else if (!strcmp(name, "vkrec")) ps4_pin_thread(2);
     if (!sampling()) return;
     ps4_sampler_start();  // (once)
     ps4_sampler_register_thread(strdup(name));  // (kept: the sampler holds the pointer)

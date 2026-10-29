@@ -56,6 +56,8 @@ struct KThread {
     // the start, the part of the wait that owner spent waiting for its core (core_wait_all: never reset)
     uint32_t woken_by;
     uint64_t core_wait_all;
+    uint64_t klock_ns;  // (measuring) time spent waiting for g_klock in kernel.c since the last "[klock]" line
+    uint32_t klock_waits;
     struct { uint32_t waker; uint8_t kind; uint32_t n; uint64_t ns, starved_ns; } wf[8];
     // (hang dumps, kernel_dump_threads) the syscall it is in (-1: none) and the guest lr at it
     volatile int svc_now;

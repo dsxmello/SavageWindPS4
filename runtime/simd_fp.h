@@ -56,6 +56,9 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
 // x*y + z with one rounding, for scalars and vectors (simd.h: the FMA instructions or simd_softfma.h)
 #ifdef SIMD_SOFT_FMA
 SI VT FN(vsoft_fma)(VT x, VT y, VT z) {
+#if defined(SFMA_RC_MIRROR) && NB == 32
+    return simd_soft_fma_s4(x, y, z);
+#endif
     VT r;
     for (int i = 0; i < NL; i++) r[i] = FN(simd_soft_fma)(x[i], y[i], z[i]);
     return r;

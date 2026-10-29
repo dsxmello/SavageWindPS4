@@ -26,6 +26,39 @@
 
 pthread_mutex_t g_klock = PTHREAD_MUTEX_INITIALIZER;
 static __thread KThread *t_cur;
+// g_klock in this file: measured when another thread holds it (kernel_log_core_waits "[klock]"), host threads too.
+// Held for a few microseconds at a time, it is first spun for: blocking on it cost the PS4's main thread ~17 us each
+// (sleep and wake), 2.4% of its time in a shrine. SAVAGEWIND_KLOCK_SPIN_US=<us> (PS4 default 10, elsewhere 0: off).
+static uint64_t g_klock_host_ns;
+static uint32_t g_klock_host_waits;
+static void klock(void) {
+    if (pthread_mutex_trylock(&g_klock) == 0) return;
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) {
+#ifdef __ORBIS__
+        int64_t d = 10000;
+#else
+        int64_t d = 0;
+#endif
+        const char *e = getenv("SAVAGEWIND_KLOCK_SPIN_US");
+        spin_ns = e ? atoll(e) * 1000 : d;
+    }
+    uint64_t t0 = plat_now_ns();
+    for (int i = 1; spin_ns; i++) {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+        if ((i & 7) == 0) {
+            if (pthread_mutex_trylock(&g_klock) == 0) goto got;
+            if ((int64_t)(plat_now_ns() - t0) >= spin_ns) break;
+        }
+    }
+    pthread_mutex_lock(&g_klock);
+got:;
+    uint64_t w = plat_now_ns() - t0;
+    if (t_cur) t_cur->klock_ns += w, t_cur->klock_waits++;  // (only this thread writes them, under g_klock)
+    else g_klock_host_ns += w, g_klock_host_waits++;
+}
 
 // ------------------------------------------------------------------ handle table
 #define MAX_HANDLES 4096
@@ -49,7 +82,7 @@ KObject *handle_get(uint32_t h) {
 }
 
 uint32_t kernel_new_handle(KObject *o) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     uint32_t h = handle_alloc(o);
     pthread_mutex_unlock(&g_klock);
     return h;
@@ -105,6 +138,10 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 // number, then first come); a thread that sees a better one waiting for its core at a syscall gives it up.
 // Generated code has no preemption points of its own, so a long stretch without syscalls keeps the core.
 // SAVAGEWIND_CORES=0 lets every thread run at once, as before.
+#ifdef __ORBIS__
+void ps4_profile_thread(const char *name);  // (platform/ps4.c: SAVAGEWIND_PS4_SAMPLE)
+void ps4_pin_thread(int role);  // (platform/ps4.c) the calling thread's CPUs: 0 a guest thread, -1 a host thread
+#endif
 typedef struct {
     pthread_mutex_t m;
     pthread_cond_t cv;
@@ -192,6 +229,9 @@ void kernel_thread_off_cores(void) {
     if (!t) return;
     core_release(t);
     t->off_cores = true;
+#ifdef __ORBIS__
+    ps4_pin_thread(-1);  // (not on the guest threads' CPUs)
+#endif
 }
 
 // Host code running on a guest thread (an HLE call) waits until t without holding the thread's core, in slices of
@@ -275,7 +315,7 @@ static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
     if (held) {
         pthread_mutex_unlock(&g_klock);
         core_acquire(t);
-        pthread_mutex_lock(&g_klock);
+        klock();
     }
     return r;
 }
@@ -361,14 +401,11 @@ static KThread *g_threads;  // every thread of this boot (g_klock)
 
 static pthread_t g_host_threads[4];  // (profiling) host threads the sampler takes too: handles 0xf000 + i
 static int g_nhost_threads;
-#ifdef __ORBIS__
-void ps4_profile_thread(const char *name);  // (platform/ps4.c: SAVAGEWIND_PS4_SAMPLE)
-#endif
 void kernel_sample_host_thread(void) {
 #ifdef __ORBIS__
     ps4_profile_thread("queue");
 #endif
-    pthread_mutex_lock(&g_klock);
+    klock();
     if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
     pthread_mutex_unlock(&g_klock);
 }
@@ -381,7 +418,7 @@ void kernel_log_core_waits(void) {
     if (!span || !cores_on()) return;
     char line[3072];
     int n = snprintf(line, sizeof line, "[cores] waited for a core over %.0f s:", span / 1e9);
-    pthread_mutex_lock(&g_klock);
+    klock();
     for (KThread *t = g_threads; t && n < (int)sizeof line - 80; t = t->anext) {
         uint64_t w = __atomic_exchange_n(&t->core_wait_ns, 0, __ATOMIC_RELAXED);
         uint64_t ww = __atomic_exchange_n(&t->core_wait_worse_ns, 0, __ATOMIC_RELAXED);
@@ -429,9 +466,21 @@ void kernel_log_core_waits(void) {
         t->blk_spun = 0;
         t->blk_ns = 0;
     }
+    // [klock]: waits for g_klock (every thread over 0.2% of the time, host threads together)
+    char kl[2048];
+    int q = snprintf(kl, sizeof kl, "[klock] waited for the kernel lock: host %.2f%% (%u)",
+                     100.0 * (double)g_klock_host_ns / (double)span, g_klock_host_waits);
+    g_klock_host_ns = 0, g_klock_host_waits = 0;
+    for (KThread *t = g_threads; t; t = t->anext) {
+        if (!t->finished && t->klock_ns * 500 >= span && q < (int)sizeof kl - 48)
+            q += snprintf(kl + q, sizeof kl - q, " h%x %.2f%% (%u)", t->handle, 100.0 * (double)t->klock_ns / (double)span,
+                          t->klock_waits);
+        t->klock_ns = 0, t->klock_waits = 0;
+    }
     pthread_mutex_unlock(&g_klock);
     LOG("%s\n", line);
     LOG("%s\n", bl);
+    LOG("%s\n", kl);
     for (int i = 0; i < nwf; i++) LOG("%s\n", wf[i]);
 }
 
@@ -460,7 +509,7 @@ void kernel_dump_threads(const char *why) {
 
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
     int n = 0;
-    pthread_mutex_lock(&g_klock);
+    klock();
     for (KThread *t = g_threads; t && n < max; t = t->anext)
         if (t->started && !t->finished) host[n] = t->host, handle[n] = t->handle, entry[n] = t->entry, n++;
     for (int i = 0; i < g_nhost_threads && n < max; i++) host[n] = g_host_threads[i], handle[n] = 0xf000 + i, entry[n] = 0, n++;
@@ -478,12 +527,13 @@ static void *thread_main(void *arg) {
     crash_handler_install();
 #ifdef __ORBIS__
     { char nm[32]; snprintf(nm, sizeof nm, "guest h%x prio %d", t->handle, t->prio); ps4_profile_thread(nm); }
+    ps4_pin_thread(0);
 #endif
     rt_set_fpcr(0);
     core_acquire(t);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
     core_release(t);
-    pthread_mutex_lock(&g_klock);
+    klock();
     t->finished = true;
     kernel_signal(&t->obj);
     pthread_mutex_unlock(&g_klock);
@@ -508,7 +558,7 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     tls_next += 0x200;
     t->cpu.tpidrro = t->tlr;
     t->cpu.thread = t;
-    pthread_mutex_lock(&g_klock);
+    klock();
     t->anext = g_threads;
     g_threads = t;
     pthread_mutex_unlock(&g_klock);
@@ -697,7 +747,7 @@ static bool block_spin(KThread *t, int64_t timeout_ns) {
 #endif
     }
     if (held) core_acquire(t);
-    pthread_mutex_lock(&g_klock);
+    klock();
     return woke;
 }
 
@@ -771,7 +821,7 @@ static uint32_t block_current(int64_t timeout_ns) {
 }
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (v != (owner | WAITERS_BIT)) {
         pthread_mutex_unlock(&g_klock);
@@ -788,14 +838,14 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 }
 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     mutex_release(addr);
     pthread_mutex_unlock(&g_klock);
     return R_OK;
 }
 
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     KThread *t = t_cur;
     // The key says "a thread waits" before the mutex is let go, as the real kernel orders it: a signaller takes
     // the mutex in user mode the moment it is free and skips svcSignalProcessWideKey when the key reads 0. Released
@@ -825,7 +875,7 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
 }
 
 static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     int woken = 0;
     bool any_left = false;
     for (;;) {
@@ -858,7 +908,7 @@ enum { ARB_WAIT_LESS = 0, ARB_DEC_WAIT_LESS = 1, ARB_WAIT_EQ = 2 };
 enum { ARB_SIGNAL = 0, ARB_SIGNAL_INC_EQ = 1, ARB_SIGNAL_MOD_EQ = 2 };
 
 static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     int32_t cur = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     bool wait;
     if (type == ARB_WAIT_LESS) wait = cur < value;
@@ -891,7 +941,7 @@ static int arbiter_wake(uint64_t addr, int32_t count) {
 }
 
 static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     uint32_t r = R_OK;
     int32_t cur = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (type == ARB_SIGNAL) {
@@ -917,7 +967,7 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 
 // ------------------------------------------------------------------ wait synchronization
 static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, int64_t timeout, int32_t *index) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     struct timespec ts;
     if (timeout > 0) deadline(&ts, timeout);
     KThread *t = t_cur;
@@ -1122,7 +1172,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x0D: {  // SetThreadPriority
         KObject *o = handle_get((uint32_t)x[0]);
         if (o) {
-            pthread_mutex_lock(&g_klock);
+            klock();
             ((KThread *)o)->base_prio = (int)x[1];
             prio_refresh((KThread *)o);
             pthread_mutex_unlock(&g_klock);
@@ -1153,7 +1203,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     case 0x10: x[0] = t_cur->core; break;  // GetCurrentProcessorNumber
     case 0x11: case 0x12: case 0x17: {  // SignalEvent / ClearEvent / ResetSignal
-        pthread_mutex_lock(&g_klock);
+        klock();
         KObject *o = handle_get((uint32_t)x[0]);
         if (!o) x[0] = R_INVALID_HANDLE;
         else {
@@ -1192,7 +1242,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x16:  // CloseHandle
-        pthread_mutex_lock(&g_klock);
+        klock();
         handle_close((uint32_t)x[0]);
         pthread_mutex_unlock(&g_klock);
         x[0] = R_OK;
@@ -1204,7 +1254,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         break;
     }
     case 0x19: {  // CancelSynchronization
-        pthread_mutex_lock(&g_klock);
+        klock();
         KObject *o = handle_get((uint32_t)x[0]);
         if (o && o->type == KOBJ_THREAD) {
             ((KThread *)o)->cancel = true;
@@ -1307,7 +1357,7 @@ void kernel_stop_threads(void (*idle)(void)) {
     uint64_t t0 = plat_now_ns(), logged = t0;
     for (;;) {
         int live = 0;
-        pthread_mutex_lock(&g_klock);
+        klock();
         for (KThread *t = g_threads; t; t = t->anext)
             if (t->started && !t->finished) { live++; wake(t); }
         pthread_cond_broadcast(&g_nothread_cond);
@@ -1340,7 +1390,7 @@ void kernel_stop_threads(void (*idle)(void)) {
 // Reboot, step 2 (threads stopped): a fresh kernel. Kernel objects are leaked rather than freed: host statics
 // can still point at some (vi.c's vsync event, signalled by its host timer thread).
 void kernel_reset(void) {
-    pthread_mutex_lock(&g_klock);
+    klock();
     for (KThread *t = g_threads, *next; t; t = next) {
         next = t->anext;
         pthread_cond_destroy(&t->cond);
@@ -1390,7 +1440,7 @@ void kernel_log_guest_chain(void) {
 
 static void dump_threads(void) {
     static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
-    pthread_mutex_lock(&g_klock);
+    klock();
     for (KThread *t = g_threads; t; t = t->anext) {
         LOG("[threads] handle %x id %llx prio %d core %d %s wait %s %llx%s lr %llx\n", t->handle,
             (unsigned long long)t->id, t->prio, t->core, t->finished ? "finished" : t->started ? "running" : "created",

@@ -132,10 +132,33 @@ static inline __attribute__((always_inline)) int sfma_fast_s(uint32_t ux, uint32
     memcpy(out, &r, 4);
     return 1;
 }
+// binary64 rounding to nearest, all three operands within 2^+-400 (nothing here can then overflow, and every partial
+// result is a multiple of 2^-906 or zero: never denormal): Boldo and Melquiond's FMA emulation (IEEE TC 2008,
+// "Emulation of FMA and correctly rounded sums: proved algorithms using rounding to odd"). The product exact as
+// uh + ul (Dekker, Veltkamp's split: no FMA instruction on the Jaguar), z + uh exact as th + tl (TwoSum), tl + ul
+// rounded to odd, and th plus that rounded to nearest once.
 static inline __attribute__((always_inline)) int sfma_fast_d(uint64_t ux, uint64_t uy, uint64_t uz, unsigned csr,
                                                             uint64_t *out) {
-    (void)ux, (void)uy, (void)uz, (void)csr, (void)out;
-    return 0;
+#pragma clang fp contract(off)
+    if (csr & 0x6000u) return 0;  // (a directed rounding mode: sfma_core)
+    if (((ux >> 52 & 0x7ff) - 623u > 800u) | ((uy >> 52 & 0x7ff) - 623u > 800u) | ((uz >> 52 & 0x7ff) - 623u > 800u))
+        return 0;
+    double x, y, z;
+    memcpy(&x, &ux, 8), memcpy(&y, &uy, 8), memcpy(&z, &uz, 8);
+    double cx = 134217729.0 * x, cy = 134217729.0 * y;  // (2^27 + 1)
+    double xh = cx - (cx - x), xl = x - xh, yh = cy - (cy - y), yl = y - yh;
+    double uh = x * y, ul = ((xh * yh - uh) + xh * yl + xl * yh) + xl * yl;
+    double th = z + uh, bt = th - z, tl = (z - (th - bt)) + (uh - bt);
+    double v = tl + ul, bv = v - tl, err = (tl - (v - bv)) + (ul - bv);
+    if (err != 0) {
+        uint64_t u;
+        memcpy(&u, &v, 8);
+        if (!(u & 1)) u += (err > 0) == (v > 0) ? 1 : (uint64_t)-1;
+        memcpy(&v, &u, 8);
+    }
+    double r = th + v;
+    memcpy(out, &r, 8);
+    return 1;
 }
 
 // MXCSR.RC as simd.h's simd_setround last set it on this thread: it is the host's default (nearest) outside the
@@ -219,5 +242,34 @@ __attribute__((noinline)) static float simd_soft_fma_s(float x, float y, float z
         if ((u & 0x1fffffffu) != 0x10000000u && ((u >> 52) & 0x7ff) >= 1023 - 126) return (float)s;
     }
     return simd_soft_fma_s_full(x, y, z);
+}
+// The same for a vector of four: the four products and sums at once in doubles (the Jaguar's AVX), with zero
+// operands too (0*y + z is z or the zero its signs give, x*y + 0 the product rounded once); simd_soft_fma_s a lane at
+// a time only when one of them can't take that path. One call where there were four (inline measured barely faster,
+// 1.45 against 1.57 ns a lane, for much more code; an inline scalar version measured no faster than the call above).
+// (It changes the control flow of the ~1200 game functions with vector FMAs: PGO profiles from before it don't fit.)
+typedef float sfma_v4f __attribute__((vector_size(16), may_alias));
+typedef uint32_t sfma_v4u __attribute__((vector_size(16), may_alias));
+typedef double sfma_v4d __attribute__((vector_size(32), may_alias));
+typedef uint64_t sfma_v4q __attribute__((vector_size(32), may_alias));
+__attribute__((noinline)) static sfma_v4f simd_soft_fma_s4(sfma_v4f x, sfma_v4f y, sfma_v4f z) {
+    sfma_v4u ux, uy, uz;
+    memcpy(&ux, &x, 16), memcpy(&uy, &y, 16), memcpy(&uz, &z, 16);
+    sfma_v4u ok = (sfma_v4u)(((ux >> 23 & 0xffu) - 1u < 254u) | ((ux << 1) == 0)) &
+                  (sfma_v4u)(((uy >> 23 & 0xffu) - 1u < 254u) | ((uy << 1) == 0)) &
+                  (sfma_v4u)(((uz >> 23 & 0xffu) - 1u < 254u) | ((uz << 1) == 0));
+    sfma_v4d p = __builtin_convertvector(x, sfma_v4d) * __builtin_convertvector(y, sfma_v4d);
+    sfma_v4d s = p + __builtin_convertvector(z, sfma_v4d);
+    sfma_v4q u;
+    memcpy(&u, &s, 32);
+    sfma_v4q hard = (sfma_v4q)(((u & 0x1fffffffu) == 0x10000000u) | ((u >> 52 & 0x7ff) < 1023 - 126)) &
+                    (sfma_v4q)(u << 1 != 0);
+    sfma_u128 okb, h0, h1;
+    sfma_v4u all = ~ok;
+    memcpy(&okb, &all, 16), memcpy(&h0, &hard, 16), memcpy(&h1, (char *)&hard + 16, 16);
+    if (__builtin_expect(!(okb | h0 | h1) && !sfma_rc, 1)) return __builtin_convertvector(s, sfma_v4f);
+    sfma_v4f r;
+    for (int i = 0; i < 4; i++) r[i] = simd_soft_fma_s(x[i], y[i], z[i]);
+    return r;
 }
 #endif

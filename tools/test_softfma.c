@@ -1,7 +1,8 @@
 // Checks runtime/simd_softfma.h (the game code's fma without FMA instructions) bit for bit against the FMA
 // instructions, in every MXCSR rounding mode with and without FTZ / DAZ. Needs a CPU with FMA.
 //   clang -O1 -mfma -Iruntime tools/test_softfma.c -o build/test_softfma && build/test_softfma [millions] [seed]
-// -DSFMA_RC_MIRROR: the PS4's binary32 fast path (simd_softfma.h sfma_rc, set here as simd_setround would).
+// -DSFMA_RC_MIRROR: the PS4's binary32 fast paths, scalar and four lanes (simd_softfma.h sfma_rc, set here as
+// simd_setround would).
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,7 @@ typedef struct { uint64_t x, y, z; } Case;
 static Case make_case(int MB, int EB, int dbl) {
     const int bias = (1 << (EB - 1)) - 1;
     Case c;
-    int kind = rnd() % 6;
+    int kind = rnd() % 8;
     if (kind == 0) {  // anything
         c.x = rnd(), c.y = rnd(), c.z = rnd();
         if (!dbl) c.x &= 0xffffffff, c.y &= 0xffffffff, c.z &= 0xffffffff;
@@ -66,9 +67,10 @@ static Case make_case(int MB, int EB, int dbl) {
     case 1: target = 1 + (int)(rnd() % 6) - 3; break;            // the underflow edge
     case 2: target = 2 * bias - (int)(rnd() % 4); break;         // the overflow edge
     case 3: target = -(int)(rnd() % (MB + 4)); break;            // product below the denormals
+    case 6: case 7: target = bias + (int)(rnd() % 121) - 60; break;  // ordinary magnitudes (the fast paths)
     default: target = (int)(rnd() % (2 * bias + 1)); break;
     }
-    int ex = (int)(rnd() % (2 * bias + 1)) - bias + bias;  // x anywhere, y to reach target
+    int ex = kind >= 6 ? bias + (int)(rnd() % 61) - 30 : (int)(rnd() % (2 * bias + 1));  // y to reach target
     int ey = target - ex + bias;
     c.x = operand(MB, EB, ex), c.y = operand(MB, EB, ey);
     int ez = target + (int)(rnd() % 7) - 3;
@@ -96,6 +98,39 @@ static Case make_case(int MB, int EB, int dbl) {
     }
     return c;
 }
+
+#ifdef SFMA_RC_MIRROR
+// The four-lane path: case c in a lane with three others, in the same mode. (A function of its own: inline here, the
+// compiler moved the reference fmaf across _mm_setcsr.)
+__attribute__((noinline)) static int check_vec4(Case c, unsigned mode, unsigned csr, long fails) {
+    uint32_t ax[4], ay[4], az[4];
+    int lane = (int)(rnd() & 3), bad = 0;
+    for (int l = 0; l < 4; l++) {
+        Case o = l == lane ? c : make_case(23, 8, 0);
+        ax[l] = (uint32_t)o.x, ay[l] = (uint32_t)o.y, az[l] = (uint32_t)o.z;
+    }
+    volatile sfma_v4f vx, vy, vz;
+    memcpy((sfma_v4f *)&vx, ax, 16), memcpy((sfma_v4f *)&vy, ay, 16), memcpy((sfma_v4f *)&vz, az, 16);
+    _mm_setcsr(csr);
+    sfma_rc = mode & 3;
+    volatile sfma_v4f vg = simd_soft_fma_s4(vx, vy, vz);
+    _mm_setcsr(0x1f80);
+    sfma_rc = 0;
+    for (int l = 0; l < 4; l++) {
+        volatile float x = vx[l], y = vy[l], z = vz[l];
+        _mm_setcsr(csr);
+        volatile float w = __builtin_fmaf(x, y, z);
+        _mm_setcsr(0x1f80);
+        float lw = w, lg = vg[l];
+        uint32_t bw, bg;
+        memcpy(&bw, &lw, 4), memcpy(&bg, &lg, 4);
+        if (bw != bg && !(lw != lw && lg != lg) && fails + bad++ < 20)
+            printf("fmaf4 lane %d rc=%u daz=%d ftz=%d  x=%08x y=%08x z=%08x  want %08x got %08x\n", l, mode & 3,
+                   !!(mode & 4), !!(mode & 8), ax[l], ay[l], az[l], bw, bg);
+    }
+    return bad;
+}
+#endif
 
 int main(int argc, char **argv) {
     long n = (argc > 1 ? atol(argv[1]) : 2) * 1000000;
@@ -132,6 +167,9 @@ int main(int argc, char **argv) {
             memcpy(&uw, &w, 4), memcpy(&ug, &g, 4);
             want = uw, got = ug;
             nan_want = w != w, nan_got = g != g;
+#ifdef SFMA_RC_MIRROR
+            fails += check_vec4(c, mode, csr, fails);
+#endif
         }
         done++;
         if (nan_want && nan_got) continue;
