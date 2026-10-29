@@ -90,7 +90,8 @@ set_source_files_properties(${SW}/runtime/nvn/smaa_data.c PROPERTIES OBJECT_DEPE
 # without the vectorizers, what the PC's start screen builds it with: runtime/gamebuild.c)
 set(SW_GEN_OPT "-O1" CACHE STRING "The game code's optimization flags")
 separate_arguments(_gen_opt UNIX_COMMAND "${SW_GEN_OPT}")
-set(GENFLAGS ${_gen_opt} -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -march=btver2
+# (SW_INLINE_DISPATCH, SW_NO_FNPROF: runtime/cpu.h)
+set(GENFLAGS ${_gen_opt} -DSW_INLINE_DISPATCH -DSW_NO_FNPROF -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -march=btver2
     -fno-omit-frame-pointer)
 set(GAMELIB_SRCS tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py
     tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt runtime/cpu.h runtime/simd.h

@@ -150,9 +150,10 @@ GuestFn dispatch_lookup(uint64_t addr) {
     return tables[t].fns[i];
 }
 
-// Small direct-mapped cache in front of the binary search
-#define DCACHE 4096
-static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
+// Small direct-mapped cache in front of the binary search (each thread's; the game code reads it too: cpu.h RT_CALL)
+#define DCACHE RT_DCACHE
+__thread RtDcacheEnt rt_dcache[DCACHE];
+#define dcache rt_dcache
 
 static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;

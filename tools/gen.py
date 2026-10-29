@@ -402,11 +402,11 @@ class Module:
             if self.in_text(t):
                 refs.add(t)
                 return [f'c->x[30] = {hx(a + 4)}; {fname(t)}(c);']
-            return [f'c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);']
+            return [f'c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; RT_CALL(c);']
         if k == 'blr':
-            return [f'c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);']
+            return [f'c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; RT_CALL(c);']
         if k == 'br':
-            return [f'c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);']
+            return [f'c->pc = {ins.target}; RT_TAIL(c);']
         if k == 'ret':
             return ['return;']
         raise Unsupported(k)
@@ -476,7 +476,7 @@ class Module:
             if entry <= t < end:
                 return f'goto L_{t:x};'
             if not self.in_text(t):
-                return f'c->pc = {hx(t)}; {st(promote.ABI_IN)}__attribute__((musttail)) return rt_dispatch(c);'
+                return f'c->pc = {hx(t)}; {st(promote.ABI_IN)}RT_TAIL(c);'
             refs.add(t)
             return f'{st(LI.get(t, ALL))}__attribute__((musttail)) return {fname(t)}(c);'
 
@@ -531,10 +531,10 @@ class Module:
                     refs.add(t)
                     out.append(f'    {lr} {st(LI.get(t, ALL))}{fname(t)}(c);{ld(OUT.get(t, ALL))}')
                 else:
-                    out.append(f'    {lr} c->pc = {hx(t)}; {st(promote.ABI_IN)}rt_dispatch(c);{ld(promote.ABI_OUT)}')
+                    out.append(f'    {lr} c->pc = {hx(t)}; {st(promote.ABI_IN)}RT_CALL(c);{ld(promote.ABI_OUT)}')
             elif k == 'blr':
                 out.append(f'    c->pc = {sub(ins.target)}; {sub(f"c->x[30] = {hx(a + 4)};")} {st(promote.ABI_IN)}'
-                           f'rt_dispatch(c);{ld(promote.ABI_OUT)}')
+                           f'RT_CALL(c);{ld(promote.ABI_OUT)}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -546,7 +546,7 @@ class Module:
                     out.append(f'    c->pc = {sub(ins.target)}; {miss}')
                     continue
                 out.append(f'    c->pc = {sub(ins.target)}; {st(promote.ABI_IN)}'
-                           '__attribute__((musttail)) return rt_dispatch(c);')
+                           'RT_TAIL(c);')
             elif k == 'ret':
                 out.append(f'    {st(OUT.get(entry, ALL))}return;')
             last = k
@@ -557,7 +557,7 @@ class Module:
             out.append('L_dispatch:')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
-            out.append('    __attribute__((musttail)) return rt_dispatch(c);')
+            out.append('    RT_TAIL(c);')
         out.append('}')
         return out
 

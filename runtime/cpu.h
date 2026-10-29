@@ -16,7 +16,9 @@ typedef struct __attribute__((aligned(16))) Cpu {
     void *thread;            // 312: runtime thread object
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
-    uint8_t _pad[512 - 336];
+    int32_t core_held;       // 336: KThread's core_held and prio (kernel.c), for the game code's dispatch (RT_CALL)
+    int32_t prio;            // 340
+    uint8_t _pad[512 - 344];
     __uint128_t v[32];       // 512
 } Cpu;
 
@@ -59,7 +61,12 @@ typedef uint8_t __attribute__((may_alias)) u8a;
 // Function-entry profiler (runtime/fnprof.c, SAVAGEWIND_FNPROF): one predictable branch per call when off.
 extern volatile int g_fnprof;
 void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
+// SW_NO_FNPROF (the PS4, whose sampler takes its place): not even that.
+#ifdef SW_NO_FNPROF
+#define FN_ENTER(a) ((void)0)
+#else
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
+#endif
 
 // GUEST_VOL: volatile in code generated with registers in locals (tools/promote.py). There a loop polling memory
 // (ldr; cbz back: a spin wait on another thread's store) has no other store left, and the C compiler hoisted the load
@@ -102,6 +109,37 @@ EXCL(8, uint8_t)
 EXCL(16, uint16_t)
 EXCL(32, uint32_t)
 EXCL(64, uint64_t)
+
+// ---- indirect calls and jumps (to c->pc): RT_CALL and RT_TAIL. SW_INLINE_DISPATCH (the PS4, where the game code
+// is in the executable and can use the runtime's thread-local cache): each call site looks the target up in the
+// thread's cache (runtime/dispatch.c) and calls it itself; rt_dispatch on a miss, or with a better thread waiting
+// for this one's core (its preemption point). One indirect branch per site instead of the one in rt_dispatch that
+// every indirect call of the game went through, which the CPU could hardly ever predict.
+void rt_dispatch(Cpu *c);
+typedef struct { uint64_t addr; void (*fn)(Cpu *); } RtDcacheEnt;
+#define RT_DCACHE 4096
+#ifdef SW_INLINE_DISPATCH
+extern __thread RtDcacheEnt rt_dcache[RT_DCACHE] __attribute__((tls_model("initial-exec")));  // (simd_softfma.h)
+extern volatile int g_core_best_wait[4];
+#define RT_DC_HIT(c, e)                                                                                         \
+    (__builtin_expect((e)->addr == (c)->pc, 1) &&                                                              \
+     __builtin_expect((c)->core_held < 0 || g_core_best_wait[(c)->core_held] >= (c)->prio, 1))
+#define RT_CALL(c)                                                                                              \
+    do {                                                                                                        \
+        RtDcacheEnt *e_ = &rt_dcache[((c)->pc >> 2) & (RT_DCACHE - 1)];                                         \
+        if (RT_DC_HIT(c, e_)) e_->fn(c);                                                                        \
+        else rt_dispatch(c);                                                                                    \
+    } while (0)
+#define RT_TAIL(c)                                                                                              \
+    do {                                                                                                        \
+        RtDcacheEnt *e_ = &rt_dcache[((c)->pc >> 2) & (RT_DCACHE - 1)];                                         \
+        if (RT_DC_HIT(c, e_)) __attribute__((musttail)) return e_->fn(c);                                       \
+        __attribute__((musttail)) return rt_dispatch(c);                                                        \
+    } while (0)
+#else
+#define RT_CALL(c) rt_dispatch(c)
+#define RT_TAIL(c) do { __attribute__((musttail)) return rt_dispatch(c); } while (0)
+#endif
 
 // ---- flags (packed NZCV in bits 31..28)
 #define FLAG_N(c) (((c)->nzcv >> 31) & 1)

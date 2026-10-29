@@ -169,7 +169,9 @@ static inline __attribute__((always_inline)) int sfma_fast_d(uint64_t ux, uint64
 #define SFMA_RC_MIRROR 1
 #endif
 #ifdef SFMA_RC_MIRROR
-extern __thread unsigned sfma_rc;
+// (initial-exec: the game code is built -fPIC, and a general-dynamic access is a __tls_get_addr call to the compiler,
+// which saved registers and spilled the arguments around it; the linker made it an %fs load, the spills stayed)
+extern __thread unsigned sfma_rc __attribute__((tls_model("initial-exec")));
 #endif
 
 // fma(x, y, z): the cases with an infinity, a NaN or a zero by the host's own multiply and add, which round and
@@ -214,32 +216,39 @@ SFMA_DEFINE(simd_soft_fma_d, d, double, uint64_t, 52, 11)
 // may then be on either side), or below the smallest normal float (fewer bits, FTZ), which simd_soft_fma_s_full
 // (round to odd) takes. No MXCSR read, no TwoSum.
 #ifdef SFMA_RC_MIRROR
+// Zeros with normal operands (~half the calls in a shrine: vectors and matrices with zero components): 0*y + z is z
+// (or a signed zero) exactly, x*y + 0 the product rounded once, as the FMA instructions give them. (A function of its
+// own: its volatiles in simd_soft_fma_s gave the common path a stack frame and five saved registers.)
+__attribute__((noinline)) static float sfma_s_zeros(float x, float y, float z) {
+    uint32_t ux, uy, uz;
+    memcpy(&ux, &x, 4), memcpy(&uy, &y, 4), memcpy(&uz, &z, 4);
+    uint32_t ax = ux & 0x7fffffffu, ay = uy & 0x7fffffffu, az = uz & 0x7fffffffu;
+    int nx = ((ux >> 23) & 0xff) - 1u < 254u, ny = ((uy >> 23) & 0xff) - 1u < 254u, nz = ((uz >> 23) & 0xff) - 1u < 254u;
+    if ((!ax || nx) && (!ay || ny) && (!az || nz)) {
+        volatile float vx = x, vy = y, vz = z;  // (the host's own multiply and add: its rounding, FTZ and signs)
+        if (!ax || !ay) {
+            volatile float p = vx * vy;
+            return p + vz;
+        }
+        return vx * vy;  // (z is a zero: x*y nonzero, so its sign wins)
+    }
+    return simd_soft_fma_s_full(x, y, z);
+}
 __attribute__((noinline)) static float simd_soft_fma_s(float x, float y, float z) {
     uint32_t ux, uy, uz;
     memcpy(&ux, &x, 4), memcpy(&uy, &y, 4), memcpy(&uz, &z, 4);
     // (exponent field neither 0 nor 255: (field - 1) < 254, unsigned)
     int normal = (((ux >> 23) & 0xff) - 1u < 254u) & (((uy >> 23) & 0xff) - 1u < 254u) & (((uz >> 23) & 0xff) - 1u < 254u);
-    if (__builtin_expect(!normal && !sfma_rc, 0)) {
-        // Zeros with normal operands (~half the calls in a shrine: vectors and matrices with zero components): 0*y + z
-        // is z (or a signed zero) exactly, x*y + 0 the product rounded once, as the FMA instructions give them
-        uint32_t ax = ux & 0x7fffffffu, ay = uy & 0x7fffffffu, az = uz & 0x7fffffffu;
-        int nx = ((ux >> 23) & 0xff) - 1u < 254u, ny = ((uy >> 23) & 0xff) - 1u < 254u, nz = ((uz >> 23) & 0xff) - 1u < 254u;
-        if ((!ax || nx) && (!ay || ny) && (!az || nz)) {
-            volatile float vx = x, vy = y, vz = z;  // (the host's own multiply and add: its rounding, FTZ and signs)
-            if (!ax || !ay) {
-                volatile float p = vx * vy;
-                return p + vz;
-            }
-            return vx * vy;  // (z is a zero: x*y nonzero, so its sign wins)
-        }
-    }
-    if (__builtin_expect(normal && !sfma_rc, 1)) {
+    unsigned rc = sfma_rc;
+    if (__builtin_expect(normal && !rc, 1)) {
         double p = (double)x * (double)y;  // (two statements: never contracted into an FMA where there is one)
         double s = p + (double)z;
         uint64_t u;
         memcpy(&u, &s, 8);
         // (29 bits below a normal float's last place: halfway is the top one alone; 1023 - 126: FLT_MIN's exponent)
         if ((u & 0x1fffffffu) != 0x10000000u && ((u >> 52) & 0x7ff) >= 1023 - 126) return (float)s;
+    } else if (!rc) {
+        return sfma_s_zeros(x, y, z);
     }
     return simd_soft_fma_s_full(x, y, z);
 }

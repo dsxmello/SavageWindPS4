@@ -207,7 +207,7 @@ static void core_acquire(KThread *t) {
         if (k->waiting[i] == t) { k->waiting[i] = k->waiting[--k->nwaiting]; break; }
     core_best_update(k);
     if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
-    t->core_held = k->owner == t ? idx : -1;
+    t->core_held = t->cpu.core_held = k->owner == t ? idx : -1;
     pthread_mutex_unlock(&k->m);
 }
 
@@ -216,7 +216,7 @@ static void core_release(KThread *t) {
     Core *k = &g_cores[t->core_held];
     pthread_mutex_lock(&k->m);
     if (k->owner == t) k->owner = NULL;
-    t->core_held = -1;
+    t->core_held = t->cpu.core_held = -1;
     pthread_cond_broadcast(&k->cv);
     pthread_mutex_unlock(&k->m);
 }
@@ -547,9 +547,9 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     pthread_cond_init(&t->cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
-    t->prio = t->base_prio = prio;
+    t->prio = t->base_prio = t->cpu.prio = prio;
     t->core = core < 0 ? 0 : core & 3;  // (-2: the process's default core, 0)
-    t->core_held = -1;
+    t->core_held = t->cpu.core_held = -1;
     t->id = next_thread_id++;
     t->cpu.x[0] = arg;
     t->cpu.sp = stack_top & ~15ull;
@@ -649,7 +649,7 @@ static bool prio_inherit_on(void) {
 
 static void prio_set(KThread *t, int p) {
     if (t->prio == p) return;
-    t->prio = p;
+    t->prio = t->cpu.prio = p;
     if (!cores_on() || t->off_cores) return;
     Core *k = &g_cores[t->core & 3];  // (waiting for its core or holding it: the waiters' order and the best wait change)
     pthread_mutex_lock(&k->m);
