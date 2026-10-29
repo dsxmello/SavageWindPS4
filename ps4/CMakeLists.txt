@@ -94,7 +94,7 @@ set(GENFLAGS ${_gen_opt} -fno-strict-aliasing -Wno-return-type -Wno-unused-label
     -fno-omit-frame-pointer)
 set(GAMELIB_SRCS tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py
     tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt runtime/cpu.h runtime/simd.h
-    runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/layout.py tools/game_sites.py)
+    runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/layout.py tools/game_sites.py tools/promote.py)
 set(_id_text "")
 foreach (f ${GAMELIB_SRCS})
     file(READ ${SW}/${f} _t)

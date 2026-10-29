@@ -61,14 +61,21 @@ extern volatile int g_fnprof;
 void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
 
-#define LD8(a)  (*(const u8a *)(uintptr_t)(a))
-#define LD16(a) (*(const u16u *)(uintptr_t)(a))
-#define LD32(a) (*(const u32u *)(uintptr_t)(a))
-#define LD64(a) (*(const u64u *)(uintptr_t)(a))
-#define ST8(a, v)  (*(u8a *)(uintptr_t)(a) = (uint8_t)(v))
-#define ST16(a, v) (*(u16u *)(uintptr_t)(a) = (uint16_t)(v))
-#define ST32(a, v) (*(u32u *)(uintptr_t)(a) = (uint32_t)(v))
-#define ST64(a, v) (*(u64u *)(uintptr_t)(a) = (uint64_t)(v))
+// GUEST_VOL: volatile in code generated with registers in locals (tools/promote.py). There a loop polling memory
+// (ldr; cbz back: a spin wait on another thread's store) has no other store left, and the C compiler hoisted the load
+// out of it (the game hung at start); before, each pass also stored a register to *c, which the load might alias.
+// The guest's loads and stores are its compiler's already: emitting each one as written costs little.
+#ifndef GUEST_VOL
+#define GUEST_VOL
+#endif
+#define LD8(a)  (*(const GUEST_VOL u8a *)(uintptr_t)(a))
+#define LD16(a) (*(const GUEST_VOL u16u *)(uintptr_t)(a))
+#define LD32(a) (*(const GUEST_VOL u32u *)(uintptr_t)(a))
+#define LD64(a) (*(const GUEST_VOL u64u *)(uintptr_t)(a))
+#define ST8(a, v)  (*(GUEST_VOL u8a *)(uintptr_t)(a) = (uint8_t)(v))
+#define ST16(a, v) (*(GUEST_VOL u16u *)(uintptr_t)(a) = (uint16_t)(v))
+#define ST32(a, v) (*(GUEST_VOL u32u *)(uintptr_t)(a) = (uint32_t)(v))
+#define ST64(a, v) (*(GUEST_VOL u64u *)(uintptr_t)(a) = (uint64_t)(v))
 
 // ---- exclusive monitor (emulated with compare-and-swap)
 #define EXCL(N, T)                                                                         \
@@ -119,47 +126,62 @@ EXCL(64, uint64_t)
 #define MKFLAGS(n, z, cy, v) \
     (((uint64_t)(n) << 31) | ((uint64_t)(z) << 30) | ((uint64_t)(cy) << 29) | ((uint64_t)(v) << 28))
 
-static inline uint64_t adds64(Cpu *c, uint64_t a, uint64_t b) {
+// (on a pointer to the flags: Cpu's own, or a promoted function's local copy, tools/promote.py)
+static inline uint64_t adds64_nz(uint64_t *nz, uint64_t a, uint64_t b) {
     uint64_t r = a + b;
-    c->nzcv = MKFLAGS(r >> 63, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 63);
+    *nz = MKFLAGS(r >> 63, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 63);
     return r;
 }
-static inline uint64_t subs64(Cpu *c, uint64_t a, uint64_t b) {
+static inline uint64_t subs64_nz(uint64_t *nz, uint64_t a, uint64_t b) {
     uint64_t r = a - b;
-    c->nzcv = MKFLAGS(r >> 63, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 63);
+    *nz = MKFLAGS(r >> 63, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 63);
     return r;
 }
-static inline uint32_t adds32(Cpu *c, uint32_t a, uint32_t b) {
+static inline uint32_t adds32_nz(uint64_t *nz, uint32_t a, uint32_t b) {
     uint32_t r = a + b;
-    c->nzcv = MKFLAGS(r >> 31, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 31);
+    *nz = MKFLAGS(r >> 31, r == 0, r < a, ((a ^ r) & (b ^ r)) >> 31);
     return r;
 }
-static inline uint32_t subs32(Cpu *c, uint32_t a, uint32_t b) {
+static inline uint32_t subs32_nz(uint64_t *nz, uint32_t a, uint32_t b) {
     uint32_t r = a - b;
-    c->nzcv = MKFLAGS(r >> 31, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 31);
+    *nz = MKFLAGS(r >> 31, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 31);
     return r;
 }
-static inline uint64_t logic64(Cpu *c, uint64_t r) { c->nzcv = MKFLAGS(r >> 63, r == 0, 0, 0); return r; }
-static inline uint32_t logic32(Cpu *c, uint32_t r) { c->nzcv = MKFLAGS(r >> 31, r == 0, 0, 0); return r; }
+static inline uint64_t logic64_nz(uint64_t *nz, uint64_t r) { *nz = MKFLAGS(r >> 63, r == 0, 0, 0); return r; }
+static inline uint32_t logic32_nz(uint64_t *nz, uint32_t r) { *nz = MKFLAGS(r >> 31, r == 0, 0, 0); return r; }
+#define adds64(c, a, b) adds64_nz(&(c)->nzcv, a, b)
+#define subs64(c, a, b) subs64_nz(&(c)->nzcv, a, b)
+#define adds32(c, a, b) adds32_nz(&(c)->nzcv, a, b)
+#define subs32(c, a, b) subs32_nz(&(c)->nzcv, a, b)
+#define logic64(c, r) logic64_nz(&(c)->nzcv, r)
+#define logic32(c, r) logic32_nz(&(c)->nzcv, r)
 
 #define ADC_IMPL(N, S)                                                                     \
-    static inline uint##N##_t adc##N(Cpu *c, uint##N##_t a, uint##N##_t b) {               \
-        return a + b + (uint##N##_t)FLAG_C(c);                                             \
+    static inline uint##N##_t adc##N##_nz(uint64_t nz, uint##N##_t a, uint##N##_t b) {     \
+        return a + b + (uint##N##_t)((nz >> 29) & 1);                                      \
     }                                                                                      \
-    static inline uint##N##_t sbc##N(Cpu *c, uint##N##_t a, uint##N##_t b) {               \
-        return a - b - 1 + (uint##N##_t)FLAG_C(c);                                         \
+    static inline uint##N##_t sbc##N##_nz(uint64_t nz, uint##N##_t a, uint##N##_t b) {     \
+        return a - b - 1 + (uint##N##_t)((nz >> 29) & 1);                                  \
     }                                                                                      \
-    static inline uint##N##_t adcs##N(Cpu *c, uint##N##_t a, uint##N##_t b) {              \
-        uint##N##_t cin = FLAG_C(c), r = a + b + cin;                                      \
+    static inline uint##N##_t adcs##N##_nz(uint64_t *nz, uint##N##_t a, uint##N##_t b) {   \
+        uint##N##_t cin = (*nz >> 29) & 1, r = a + b + cin;                                \
         int carry = cin ? r <= a : r < a;                                                  \
-        c->nzcv = MKFLAGS(r >> (N - 1), r == 0, carry, ((a ^ r) & (b ^ r)) >> (N - 1));    \
+        *nz = MKFLAGS(r >> (N - 1), r == 0, carry, ((a ^ r) & (b ^ r)) >> (N - 1));        \
         return r;                                                                          \
     }                                                                                      \
-    static inline uint##N##_t sbcs##N(Cpu *c, uint##N##_t a, uint##N##_t b) {              \
-        return adcs##N(c, a, (uint##N##_t)~b);                                             \
+    static inline uint##N##_t sbcs##N##_nz(uint64_t *nz, uint##N##_t a, uint##N##_t b) {   \
+        return adcs##N##_nz(nz, a, (uint##N##_t)~b);                                       \
     }
 ADC_IMPL(64, )
 ADC_IMPL(32, )
+#define adc64(c, a, b) adc64_nz((c)->nzcv, a, b)
+#define sbc64(c, a, b) sbc64_nz((c)->nzcv, a, b)
+#define adcs64(c, a, b) adcs64_nz(&(c)->nzcv, a, b)
+#define sbcs64(c, a, b) sbcs64_nz(&(c)->nzcv, a, b)
+#define adc32(c, a, b) adc32_nz((c)->nzcv, a, b)
+#define sbc32(c, a, b) sbc32_nz((c)->nzcv, a, b)
+#define adcs32(c, a, b) adcs32_nz(&(c)->nzcv, a, b)
+#define sbcs32(c, a, b) sbcs32_nz(&(c)->nzcv, a, b)
 
 // ---- bit ops
 #define ROR64(v, r) ((uint64_t)(v) >> ((r) & 63) | (uint64_t)(v) << ((64 - ((r) & 63)) & 63))

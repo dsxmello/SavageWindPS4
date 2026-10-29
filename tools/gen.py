@@ -33,6 +33,7 @@ from unicorn import arm64_const as A
 import game_sites
 import layout
 import patches
+import promote
 from analyze import eh_frame_extents, eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, header
@@ -84,6 +85,7 @@ class Module:
         self.jt_cache = {}
         self.setjmps = self.setjmp_targets()
         self.sites, self.patches = {}, {}  # (main: tools/game_sites.py, tools/patches.py)
+        self.promo = None  # (--promote: tools/promote.py's (functions, LI, OUT))
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -419,18 +421,41 @@ class Module:
         # it lives in a cold copy of the function (<name>_r), entered on a miss only: in the function itself it
         # split every instruction into its own block and made LLVM's register coalescer take minutes per function.
         refs = set()
+        p = self.promo and entry in self.promo[0]
         if not tables or 'all' in tables.values():
-            out = self._emit_body(entry, end, labels, tables, refs, 'plain')
+            out = self._emit_body(entry, end, labels, tables, refs, 'plain', p)
         else:
             out = [f'static void {fname(entry)}_r(Cpu *c);']
-            out += self._emit_body(entry, end, labels, tables, refs, 'fast')
+            out += self._emit_body(entry, end, labels, tables, refs, 'fast', p)
             out += self._emit_body(entry, end, labels, tables, refs, 'resume')
         self._refs = refs
         return out
 
-    def _emit_body(self, entry, end, labels, tables, refs, mode):
+    def _emit_body(self, entry, end, labels, tables, refs, mode, promoted=False):
         """One C function for entry..end. mode: 'plain' (the all-instruction fallback inside when it has tables),
-        'fast' (a table miss goes on in <name>_r) or 'resume' (<name>_r: from c->pc, through that fallback)."""
+        'fast' (a table miss goes on in <name>_r) or 'resume' (<name>_r: from c->pc, through that fallback).
+        promoted: its registers in locals (tools/promote.py), stored back where other code reads them."""
+        if promoted:
+            fns, LI, OUT = self.promo
+            f = fns[entry]
+            sub = promote.subst
+
+            def st(mask):  # (the locals in mask that this function changes)
+                return promote.store(mask & f.wr)
+
+            def ld(mask):  # (after a statement: with its separating space)
+                return (' ' + promote.load(mask & f.ref)).rstrip()
+        else:
+            def sub(t):
+                return t
+
+            def st(mask):
+                return ''
+
+            def ld(mask):
+                return ''
+            LI = OUT = {}
+        ALL = promote.ALL
         if mode == 'resume':
             # (optnone: optimized, its switch made the copy as slow to build as the function used to be, and it is
             # never run in practice. Unoptimized, its frame can reach ~250 KB: guest threads have 256 MB host stacks)
@@ -438,6 +463,8 @@ class Module:
             out = [head, '    goto L_dispatch;']
         else:
             out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+            if promoted and f.ref:
+                out.append('    ' + promote.declare(f.ref))
         batch = []
 
         def flush():
@@ -449,14 +476,15 @@ class Module:
             if entry <= t < end:
                 return f'goto L_{t:x};'
             if not self.in_text(t):
-                return f'c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
+                return f'c->pc = {hx(t)}; {st(promote.ABI_IN)}__attribute__((musttail)) return rt_dispatch(c);'
             refs.add(t)
-            return f'__attribute__((musttail)) return {fname(t)}(c);'
+            return f'{st(LI.get(t, ALL))}__attribute__((musttail)) return {fname(t)}(c);'
 
         all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
         if all_labels:
             labels = set(range(entry, end, 4))
-        miss = f'__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast' else 'goto L_dispatch;'
+        miss = (f'{st(ALL)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
+                else 'goto L_dispatch;')
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
@@ -483,23 +511,30 @@ class Module:
                 continue
             flush()
             if k == 'op' or k == 'trap':
-                out.append('    ' + ins.code)
+                if 'rt_udf(' in ins.code:
+                    out.append('    ' + st(ALL) + ins.code)
+                elif 'rt_svc(' in ins.code:
+                    out.append('    ' + st(promote.SVC_IN) + sub(ins.code) + ld(promote.SVC_OUT))
+                else:
+                    out.append('    ' + sub(ins.code))
             elif k == 'b':
                 out.append('    ' + jump(ins.target))
             elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+                out.append(f'    if ({sub(ins.cond)}) {{ {jump(ins.target)} }}')
             elif k == 'bl':
                 t = ins.target
+                lr = sub(f'c->x[30] = {hx(a + 4)};')
                 if t in self.setjmps:
                     refs.add(t)
                     out.append('    ' + setjmp_call(t, a + 4))
                 elif self.in_text(t):
                     refs.add(t)
-                    out.append(f'    c->x[30] = {hx(a + 4)}; {fname(t)}(c);')
+                    out.append(f'    {lr} {st(LI.get(t, ALL))}{fname(t)}(c);{ld(OUT.get(t, ALL))}')
                 else:
-                    out.append(f'    c->x[30] = {hx(a + 4)}; c->pc = {hx(t)}; rt_dispatch(c);')
+                    out.append(f'    {lr} c->pc = {hx(t)}; {st(promote.ABI_IN)}rt_dispatch(c);{ld(promote.ABI_OUT)}')
             elif k == 'blr':
-                out.append(f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; rt_dispatch(c);')
+                out.append(f'    c->pc = {sub(ins.target)}; {sub(f"c->x[30] = {hx(a + 4)};")} {st(promote.ABI_IN)}'
+                           f'rt_dispatch(c);{ld(promote.ABI_OUT)}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -507,16 +542,17 @@ class Module:
                     continue
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
-                    out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {ins.target}; {miss}')
+                    out.append(f'    switch ({sub(ins.target)}) {{ {cases} default: break; }}')
+                    out.append(f'    c->pc = {sub(ins.target)}; {miss}')
                     continue
-                out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
+                out.append(f'    c->pc = {sub(ins.target)}; {st(promote.ABI_IN)}'
+                           '__attribute__((musttail)) return rt_dispatch(c);')
             elif k == 'ret':
-                out.append('    return;')
+                out.append(f'    {st(OUT.get(entry, ALL))}return;')
             last = k
         flush()
         if last not in ('b', 'br', 'ret', 'trap'):
-            out.append('    ' + jump(end) if end < self.hi else f'    rt_udf(c, {hx(end)});')
+            out.append('    ' + jump(end) if end < self.hi else f'    {st(ALL)}rt_udf(c, {hx(end)});')
         if all_labels:
             out.append('L_dispatch:')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
@@ -626,6 +662,9 @@ def generate(name, nso, base, outdir, opts, sites=None):
     entries, rounds = discover(m, starts)
     print(f'{name}: {len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
           f'{time.time() - t0:.0f}s', file=sys.stderr)
+    if opts.promote:
+        m.promo = promote.analyze(m, entries, hle, lambda s: print(f'{name}: {s}, {time.time() - t0:.0f}s',
+                                                                    file=sys.stderr))
 
     os.makedirs(outdir, exist_ok=True)
     order = sorted(entries)
@@ -658,7 +697,8 @@ def generate(name, nso, base, outdir, opts, sites=None):
             if n > opts.big_fn:
                 break
         path = os.path.join(outdir, f'{name}_{nchunks:03d}.c')
-        text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+        text = [('#define GUEST_VOL volatile\n' if m.promo else '') + '#include "cpu.h"\n' +
+                ('#include "simd.h"\n' if m.lifter.sc else '')]
         if any('rt_setjmp_slot(' in l for l in body):
             text += ['#include <setjmp.h>\njmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf);\n']
         text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
@@ -701,6 +741,7 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--any-version', action='store_true')  # (a main module of a version not supported yet)
     ap.add_argument('--no-sites', action='store_true')  # (made-up modules, tools/test_layout.py: no sites, no patches)
+    ap.add_argument('--promote', action='store_true')  # guest registers in C locals (tools/promote.py)
     ap.add_argument('--simd', choices=('asm', 'c'),
                     default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
     args = ap.parse_args()

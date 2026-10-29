@@ -128,7 +128,7 @@ endif
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h
-GAMELIB_SRCS += tools/layout.py tools/game_sites.py
+GAMELIB_SRCS += tools/layout.py tools/game_sites.py tools/promote.py
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)'; echo '$(GENFLAGS_ZIG)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 # The compatible target (#9): x86-64 CPUs without AVX2 / FMA / BMI2 get the game code built with GENARCH_COMPAT in
 # place of GENARCH (no -mfma: simd.h's fma is runtime/simd_softfma.h, slower). The start screen builds the one the CPU
