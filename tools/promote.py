@@ -106,7 +106,7 @@ def declare(mask):
 
 class Fn:
     """One C function's instructions for the analysis (build)."""
-    __slots__ = ('entry', 'end', 'n', 'use', 'kill', 'succ', 'bnd', 'calls', 'tails', 'wr', 'ref')
+    __slots__ = ('entry', 'end', 'n', 'use', 'kill', 'succ', 'bnd', 'calls', 'tails', 'wr', 'ref', 'wrs', 'din')
 
 
 def build(m, entry, end, tables):
@@ -121,6 +121,7 @@ def build(m, entry, end, tables):
     f.n = n
     f.use, f.kill, f.succ, f.bnd = [0] * n, [0] * n, [()] * n, [None] * n
     f.calls, f.tails = set(), set()
+    f.wrs = [0] * n  # (what each instruction writes: din below)
     wr = ref = 0
     for i in range(n):
         a = entry + 4 * i
@@ -156,6 +157,7 @@ def build(m, entry, end, tables):
                     if m.in_text(end):
                         f.tails.add(end)
             wr |= w
+            f.wrs[i] = w
             ref |= u | w
         elif k in ('b', 'bcond'):
             u = scan(ins.cond)[0] if k == 'bcond' else 0
@@ -180,6 +182,7 @@ def build(m, entry, end, tables):
                 f.bnd[i] = ('ucall', ABI_IN, ABI_OUT)
             f.succ[i] = nxt
             wr |= X30
+            f.wrs[i] = X30
             ref |= X30
             if fall_out:
                 return None  # (a call as the last instruction: leave such odd code alone)
@@ -187,6 +190,7 @@ def build(m, entry, end, tables):
             u = scan(ins.target)[0]
             f.use[i], f.succ[i], f.bnd[i] = u, nxt, ('ucall', ABI_IN, ABI_OUT)
             wr |= X30
+            f.wrs[i] = X30
             ref |= u | X30
             if fall_out:
                 return None
@@ -215,6 +219,7 @@ def build(m, entry, end, tables):
         else:
             return None
     f.wr, f.ref = wr, ref
+    f.din = None
     return f
 
 
@@ -339,6 +344,26 @@ def analyze(m, entries, hle, log):
             if want & ~OUT.get(t, 0):
                 OUT[t] = OUT.get(t, 0) | want
                 requeue(t)
+    # Which locals may differ from *c before each instruction (written since the entry or since a call reloaded them):
+    # only those get stored back before a call, a tail call or a return
+    for a, f in fns.items():
+        din = [None] * f.n
+        if f.n:
+            din[0] = 0
+        work2 = [0] if f.n else []
+        while work2:
+            i = work2.pop()
+            d = din[i] | f.wrs[i]
+            b = f.bnd[i]
+            if b is not None and b[0] == 'call':
+                d &= ~(OUT.get(b[1], ALL) & f.ref)
+            elif b is not None and b[0] == 'ucall':
+                d &= ~(b[2] & f.ref)
+            for t in f.succ[i]:
+                if din[t] is None or d & ~din[t]:
+                    din[t] = d if din[t] is None else din[t] | d
+                    work2.append(t)
+        f.din = [x if x is not None else 0 for x in din]
     n_li = sum(1 for a in fns if li_of(a) & SCRATCH)
     m.promo_leftover = [a for a in fns if a in abi and LI[a] & SCRATCH]  # (compiled functions reading leftovers)
     n_out = sum(1 for a in fns if OUT[a] & SCRATCH)

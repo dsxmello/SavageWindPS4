@@ -440,14 +440,20 @@ class Module:
             f = fns[entry]
             sub = promote.subst
 
-            def st(mask):  # (the locals in mask that this function changes)
-                return promote.store(mask & f.wr)
+            # Before a call, a tail call or a return: the locals in mask that may differ from *c there (dirty[0]:
+            # tools/promote.py's din, for the instruction being emitted). After a call (ld): those that came back.
+            dirty = [0]
+
+            def st(mask):
+                return promote.store(mask & f.wr & dirty[0])
 
             def ld(mask):  # (after a statement: with its separating space)
                 return (' ' + promote.load(mask & f.ref)).rstrip()
         else:
             def sub(t):
                 return t
+
+            dirty = [0]
 
             def st(mask):
                 return ''
@@ -483,11 +489,14 @@ class Module:
         all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
         if all_labels:
             labels = set(range(entry, end, 4))
-        miss = (f'{st(ALL)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
-                else 'goto L_dispatch;')
+        def miss():  # (at the table's br: what is dirty there)
+            return (f'{st(ALL)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
+                    else 'goto L_dispatch;')
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
+            if promoted:
+                dirty[0] = f.din[(a - entry) // 4]
             if a in labels:
                 flush()
                 out.append(f'L_{a:x}:;')
@@ -529,12 +538,15 @@ class Module:
                     out.append('    ' + setjmp_call(t, a + 4))
                 elif self.in_text(t):
                     refs.add(t)
+                    dirty[0] |= promote.X30
                     out.append(f'    {lr} {st(LI.get(t, ALL))}{fname(t)}(c);{ld(OUT.get(t, ALL))}')
                 else:
+                    dirty[0] |= promote.X30
                     out.append(f'    {lr} c->pc = {hx(t)}; {st(promote.ABI_IN)}RT_CALL(c);{ld(promote.ABI_OUT)}')
             elif k == 'blr':
-                out.append(f'    c->pc = {sub(ins.target)}; {sub(f"c->x[30] = {hx(a + 4)};")} {st(promote.ABI_IN)}'
-                           f'RT_CALL(c);{ld(promote.ABI_OUT)}')
+                dirty[0] |= promote.X30
+                out.append(f'    c->pc = {sub(ins.target)}; {sub(f"c->x[30] = {hx(a + 4)};")} '
+                           f'{st(promote.ABI_IN)}RT_CALL(c);{ld(promote.ABI_OUT)}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -543,7 +555,7 @@ class Module:
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
                     out.append(f'    switch ({sub(ins.target)}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {sub(ins.target)}; {miss}')
+                    out.append(f'    c->pc = {sub(ins.target)}; {miss()}')
                     continue
                 out.append(f'    c->pc = {sub(ins.target)}; {st(promote.ABI_IN)}'
                            'RT_TAIL(c);')
@@ -551,6 +563,9 @@ class Module:
                 out.append(f'    {st(OUT.get(entry, ALL))}return;')
             last = k
         flush()
+        if promoted and end > entry:
+            i = (end - entry) // 4 - 1
+            dirty[0] = f.din[i] | f.wrs[i]
         if last not in ('b', 'br', 'ret', 'trap'):
             out.append('    ' + jump(end) if end < self.hi else f'    {st(ALL)}rt_udf(c, {hx(end)});')
         if all_labels:
