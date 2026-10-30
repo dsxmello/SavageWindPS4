@@ -23,7 +23,9 @@ include(${DOLPHINPS4}/toolchain/ps4-love-style.cmake)  # PS4_RUNTIME_SOURCES, ps
 set(SW_PGO "" CACHE STRING "Profile-guided optimization: generate | use")
 set(SW_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata (SW_PGO=use)")
 if (SW_PGO STREQUAL "generate")
-    add_compile_options(-fprofile-generate)
+    # (no counter promotion: in promoted game code a function's dispatch loop has thousands of exits, and the pass
+    # that moves counters out of loops ran for hours on single files; it only speeds up the instrumented build)
+    add_compile_options(-fprofile-generate "SHELL:-mllvm -do-counter-promotion=false")
     add_compile_definitions(SW_PS4_PGO_GENERATE=1)
     # The profile sections are orphans the OpenOrbis script places past the data segment's file image: on the
     # console they start as zeros (TriAevum 1.19: records without names, hashes or counters). Inside .data they keep
