@@ -546,7 +546,7 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
 // before it would see its data), kept from list to list (BOTW updates the same ~40 small ranges every frame); memory
 // outside the heap; and what the patches below change. A range updated for the first time with constant buffers of
 // this list already read in place waits for the GPU first (once per range: the copies take over from then on).
-// PS4 by default; SAVAGEWIND_VK_UBO_DIRECT=0 / 1 turns it off / on (the PC: off by default).
+// On by default (PC too: +9% in a light open-world scene on an Iris Xe, even in a heavy one); SAVAGEWIND_VK_UBO_DIRECT=0 turns it off.
 #define UUBS_MAX 256
 static struct { uint64_t lo, hi; } uubs[UUBS_MAX];  // every range UpdateUniformBuffer wrote since the boot
 static int nuubs;
@@ -554,11 +554,7 @@ static bool uubs_full, ubo_direct_used;  // (no room: every constant buffer copi
 static bool ubo_direct_on(void) {
     static int on = -1;
     if (on < 0) {
-#ifdef __ORBIS__
         on = 1;
-#else
-        on = 0;
-#endif
         if (getenv("SAVAGEWIND_VK_UBO_DIRECT")) on = atoi(getenv("SAVAGEWIND_VK_UBO_DIRECT")) != 0;
         LOG("[vk] constant buffers %s\n", on ? "read in place from the guest heap" : "copied");
     }
