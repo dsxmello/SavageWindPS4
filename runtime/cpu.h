@@ -120,10 +120,9 @@ typedef struct { uint64_t addr; void (*fn)(Cpu *); } RtDcacheEnt;
 #define RT_DCACHE 4096
 #ifdef SW_INLINE_DISPATCH
 extern __thread RtDcacheEnt rt_dcache[RT_DCACHE] __attribute__((tls_model("initial-exec")));  // (simd_softfma.h)
-extern volatile int g_core_best_wait[4];
+extern volatile unsigned char g_core_preempt[5];  // (kernel.c)
 #define RT_DC_HIT(c, e)                                                                                         \
-    (__builtin_expect((e)->addr == (c)->pc, 1) &&                                                              \
-     __builtin_expect((c)->core_held < 0 || g_core_best_wait[(c)->core_held] >= (c)->prio, 1))
+    (__builtin_expect((e)->addr == (c)->pc, 1) && __builtin_expect(!g_core_preempt[(c)->core_held + 1], 1))
 #define RT_CALL(c)                                                                                              \
     do {                                                                                                        \
         RtDcacheEnt *e_ = &rt_dcache[((c)->pc >> 2) & (RT_DCACHE - 1)];                                         \

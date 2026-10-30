@@ -141,6 +141,7 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 #ifdef __ORBIS__
 void ps4_profile_thread(const char *name);  // (platform/ps4.c: SAVAGEWIND_PS4_SAMPLE)
 void ps4_pin_thread(int role);  // (platform/ps4.c) the calling thread's CPUs: 0 a guest thread, -1 a host thread
+void ps4_guest_prio(int prio);  // (platform/ps4.c) the calling guest thread's host priority from its own
 #endif
 typedef struct {
     pthread_mutex_t m;
@@ -160,6 +161,15 @@ static int g_cores_on = -1;
 // The best (lowest) priority among the threads waiting for each core, INT_MAX with none: what dispatch.c checks at every
 // indirect call (kernel_preempt). SAVAGEWIND_NO_PREEMPT=1: kept at INT_MAX (preemption at syscalls only, as before).
 volatile int g_core_best_wait[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+// The same as a yes or no for the game code's inline dispatch (cpu.h RT_DC_HIT: one load), indexed by the holder's
+// core + 1 (0: holding none, never set): a thread better than the core's holder waits for it. (A check at every
+// function entry too, 0.54, changed nothing: the shrine's h120 still waited behind worse threads 10% of its time.)
+// (k->m held)
+volatile unsigned char g_core_preempt[5];
+static void core_flag_update(Core *k) {
+    int i = (int)(k - g_cores);
+    __atomic_store_n(&g_core_preempt[i + 1], k->owner && g_core_best_wait[i] < k->owner->prio, __ATOMIC_RELAXED);
+}
 static void core_best_update(Core *k) {  // (k->m held)
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_PREEMPT") != NULL;
@@ -167,6 +177,7 @@ static void core_best_update(Core *k) {  // (k->m held)
     for (int i = 0; i < k->nwaiting && !off; i++)
         if (k->waiting[i]->prio < best) best = k->waiting[i]->prio;
     __atomic_store_n(&g_core_best_wait[k - g_cores], best, __ATOMIC_RELAXED);
+    core_flag_update(k);
 }
 
 static bool cores_on(void) {
@@ -208,6 +219,7 @@ static void core_acquire(KThread *t) {
     core_best_update(k);
     if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
     t->core_held = t->cpu.core_held = k->owner == t ? idx : -1;
+    core_flag_update(k);
     pthread_mutex_unlock(&k->m);
 }
 
@@ -217,6 +229,7 @@ static void core_release(KThread *t) {
     pthread_mutex_lock(&k->m);
     if (k->owner == t) k->owner = NULL;
     t->core_held = t->cpu.core_held = -1;
+    core_flag_update(k);
     pthread_cond_broadcast(&k->cv);
     pthread_mutex_unlock(&k->m);
 }
@@ -528,6 +541,7 @@ static void *thread_main(void *arg) {
 #ifdef __ORBIS__
     { char nm[32]; snprintf(nm, sizeof nm, "guest h%x prio %d", t->handle, t->prio); ps4_profile_thread(nm); }
     ps4_pin_thread(0);
+    ps4_guest_prio(t->prio);
 #endif
     rt_set_fpcr(0);
     core_acquire(t);
@@ -650,6 +664,9 @@ static bool prio_inherit_on(void) {
 static void prio_set(KThread *t, int p) {
     if (t->prio == p) return;
     t->prio = t->cpu.prio = p;
+#ifdef __ORBIS__
+    if (t == t_cur) ps4_guest_prio(p);  // (another thread's, raised while it holds a mutex: its host priority stays)
+#endif
     if (!cores_on() || t->off_cores) return;
     Core *k = &g_cores[t->core & 3];  // (waiting for its core or holding it: the waiters' order and the best wait change)
     pthread_mutex_lock(&k->m);

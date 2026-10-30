@@ -223,6 +223,21 @@ void ps4_pin_thread(int role) {
     if (r) plat_log("[plat] scePthreadSetaffinity 0x%llx: 0x%x\n", (unsigned long long)mask, r);
 }
 
+// The guest threads' own priorities on the host (PS4: 256 highest .. 767, 700 the default every thread had): Horizon's
+// 0..63 to 500..689, all above the host's threads (700). The game's threads run FIFO with no time slices, so with one
+// priority for all a thread woken for a core it now holds waited for a CPU until whatever ran there slept - often a
+// worse guest thread spinning in block_spin (up to 150 us). Now the better one takes the CPU, as on the Switch.
+// SAVAGEWIND_PS4_GUEST_PRIO=0: every thread at 700 (as before).
+void ps4_guest_prio(int prio) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("SAVAGEWIND_PS4_GUEST_PRIO") && !strcmp(getenv("SAVAGEWIND_PS4_GUEST_PRIO"), "0"));
+    if (!on) return;
+    int p = 500 + 3 * (prio < 0 ? 0 : prio > 63 ? 63 : prio);
+    int r = scePthreadSetprio(scePthreadSelf(), p);
+    static int logged;
+    if (r && !logged++) plat_log("[plat] scePthreadSetprio %d: 0x%x\n", p, r);
+}
+
 #define HOST_THREAD_STACK (2ull << 20)
 typedef struct { void *(*fn)(void *); void *arg; } HostStart;
 static void *host_thread_start(void *a) {
