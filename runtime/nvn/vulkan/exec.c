@@ -490,7 +490,8 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
 // a frame in the open world.)
 #define GCOPY_TAB 4096
 #define UUB_MAX 64
-static struct { uint64_t addr, size, gen, serial, mask; int chunk; VkSpan span; } gcopy[GCOPY_TAB];
+// (base: the entry's first copy in this submission, with the update count it was made at: guest_copy_delta)
+static struct { uint64_t addr, size, gen, serial, mask; int chunk; VkSpan span, base; uint64_t base_serial, base_sub; } gcopy[GCOPY_TAB];
 static uint64_t gcopy_gen = 1;
 static struct { uint64_t lo, hi, serial; } uubt[UUB_MAX];  // ranges UpdateUniformBuffer wrote, with the last update's count
 static int nuub;
@@ -514,11 +515,61 @@ static void uub_note(uint64_t lo, uint64_t hi) {
     guest_copy_flush();  // (a range copies made before don't know; or no room: every update drops everything)
 }
 
+// A copy made stale by UpdateUniformBuffer differs from the submission's first copy of the range (its base) only in
+// the written ranges updated since: those bytes are copied here, the rest by the GPU from the base (the upload buffer
+// runs before the submission's draws). Each update used to copy the whole range again: BOTW's ~28 KB constant buffers
+// after ~450 small updates a frame, ~14 MB a frame in the open world, ~10% of the PS4's queue thread in memcpy.
+// Bases are per submission (a chunk is reused only once its submissions complete). PS4 bench (open world, standing):
+// 25.0 -> 25.9 fps, memcpy 10% -> 3% of the queue thread. The PC's Iris Xe, short of GPU time, lost 7% to the ~10000
+// GPU copies a second (49.2 -> 45.9 fps standing still): off there. SAVAGEWIND_VK_GCOPY_DELTA=0 / 1: off / on.
+static uint64_t stat_gcopy_delta, stat_gcopy_delta_bytes;
+static bool guest_copy_delta(__typeof__(gcopy[0]) *e, uint64_t addr, uint64_t size, VkSpan *out) {
+    static int on = -1;
+    if (on < 0) {
+#ifdef __ORBIS__
+        on = 1;
+#else
+        on = 0;
+#endif
+        if (getenv("SAVAGEWIND_VK_GCOPY_DELTA")) on = atoi(getenv("SAVAGEWIND_VK_GCOPY_DELTA")) != 0;
+    }
+    if (!on || !e->base.buf || e->base_sub != vk_pending_seq()) return false;
+    struct { uint64_t lo, hi; } d[UUB_MAX];
+    int n = 0;
+    uint64_t bytes = 0;
+    for (uint64_t m = e->mask; m; m &= m - 1) {
+        int i = __builtin_ctzll(m);
+        if (uubt[i].serial <= e->base_serial) continue;
+        uint64_t lo = (uubt[i].lo > addr ? uubt[i].lo : addr) - addr, hi = (uubt[i].hi < addr + size ? uubt[i].hi : addr + size) - addr;
+        int j = n++;
+        for (; j > 0 && d[j - 1].lo > lo; j--) d[j] = d[j - 1];  // (by offset; the written ranges don't overlap)
+        d[j].lo = lo, d[j].hi = hi;
+        bytes += hi - lo;
+    }
+    if (bytes * 2 > size) return false;  // (most of it: a new base)
+    VkSpan s = vk_transient(size, 256);
+    VkBufferCopy cp[UUB_MAX + 1];
+    int ncp = 0;
+    uint64_t at = 0;
+    for (int j = 0; j < n; j++) {
+        memcpy((uint8_t *)s.ptr + d[j].lo, (const uint8_t *)(uintptr_t)addr + d[j].lo, d[j].hi - d[j].lo);
+        if (d[j].lo > at) cp[ncp++] = (VkBufferCopy){e->base.off + at, s.off + at, d[j].lo - at};
+        at = d[j].hi;
+    }
+    if (at < size) cp[ncp++] = (VkBufferCopy){e->base.off + at, s.off + at, size - at};
+    if (ncp) vkCmdCopyBuffer(vk_upload_cmd(), e->base.buf, s.buf, (uint32_t)ncp, cp);
+    stat_gcopy_delta++;
+    stat_gcopy_delta_bytes += bytes;
+    *out = s;
+    return true;
+}
+
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
     __typeof__(gcopy[0]) *e = &gcopy[slot];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED);
+    VkSpan s;
     if (e->gen == gen && e->addr == addr && e->size == size) {
         bool stale = false;
         for (uint64_t m = e->mask; m && !stale; m &= m - 1) stale = uubt[__builtin_ctzll(m)].serial > e->serial;
@@ -528,14 +579,19 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
             stat_gcopy_hit++;
             return e->span;
         }
+        if (guest_copy_delta(e, addr, size, &s)) {  // (the mask stays: a new or grown written range drops every copy)
+            e->serial = uub_serial; e->chunk = active; e->span = s;
+            return s;
+        }
     }
     stat_gcopy_miss++;
     stat_gcopy_bytes += size;
-    VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
+    s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     uint64_t mask = 0;
     for (int i = 0; i < nuub; i++)
         if (addr < uubt[i].hi && uubt[i].lo < addr + size) mask |= 1ull << i;
     e->addr = addr; e->size = size; e->gen = gen; e->serial = uub_serial; e->mask = mask; e->chunk = active; e->span = s;
+    e->base = s; e->base_serial = uub_serial; e->base_sub = vk_pending_seq();
     return s;
 }
 
@@ -773,13 +829,15 @@ const char *renderer_stats(void) {
                  (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused, (unsigned long long)stat_feedback_loops,
                  (unsigned long long)stat_feedback_barriers, (unsigned long long)stat_gw_waits, (unsigned long long)stat_gw_holds);
         n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB)",
+        snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB) %llu delta (%.2f MB)",
                  (unsigned long long)stat_uub, (unsigned long long)stat_uub_same, (unsigned long long)stat_gcopy_hit,
-                 (unsigned long long)stat_gcopy_miss, stat_gcopy_bytes / 1048576.0);
+                 (unsigned long long)stat_gcopy_miss, stat_gcopy_bytes / 1048576.0, (unsigned long long)stat_gcopy_delta,
+                 stat_gcopy_delta_bytes / 1048576.0);
         n = strlen(stats_text);
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
         stat_build_waits = 0;
         stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = 0;
+        stat_gcopy_delta = stat_gcopy_delta_bytes = 0;
         stat_gw_waits = stat_gw_holds = 0;
         stat_sets = stat_sets_reused = 0;
         stat_feedback_loops = stat_feedback_barriers = 0;

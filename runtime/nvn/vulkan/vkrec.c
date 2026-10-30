@@ -30,7 +30,7 @@ enum {
     OP_SetPrimitiveTopology, OP_SetPrimitiveRestartEnable, OP_SetLineWidth, OP_SetFrontFace, OP_SetDepthCompareOp,
     OP_SetDepthBiasEnable, OP_SetDepthBias, OP_SetCullMode, OP_SetBlendConstants, OP_CopyImage, OP_ClearColorImage,
     OP_ClearAttachments, OP_BindVertexBuffers, OP_ResolveImage, OP_EndQuery, OP_DrawIndexed, OP_Dispatch,
-    OP_ClearDepthStencilImage, OP_BindIndexBuffer, OP_BeginQuery,
+    OP_ClearDepthStencilImage, OP_BindIndexBuffer, OP_BeginQuery, OP_CopyBuffer,
 };
 typedef struct { uint32_t op, size; } Hdr;  // size: the whole entry, a multiple of 16
 
@@ -204,6 +204,14 @@ void vr_CmdCopyBufferToImage(CB, VkBuffer buf, VkImage img, VkImageLayout lay, u
     BufImgA *a = rec_begin(OP_CopyBufferToImage, sizeof *a + A8(n * sizeof *r));
     Cur c = {(uint8_t *)(a + 1)};
     *a = (BufImgA){cb, buf, img, lay, n, cur_put(&c, r, n * sizeof *r)};
+    rec_commit();
+}
+typedef struct { CB; VkBuffer src, dst; uint32_t n; const VkBufferCopy *r; } BufBufA;
+void vr_CmdCopyBuffer(CB, VkBuffer src, VkBuffer dst, uint32_t n, const VkBufferCopy *r) {
+    if (!vr_enabled()) { vkCmdCopyBuffer(cb, src, dst, n, r); return; }
+    BufBufA *a = rec_begin(OP_CopyBuffer, sizeof *a + A8(n * sizeof *r));
+    Cur c = {(uint8_t *)(a + 1)};
+    *a = (BufBufA){cb, src, dst, n, cur_put(&c, r, n * sizeof *r)};
     rec_commit();
 }
 void vr_CmdCopyImageToBuffer(CB, VkImage img, VkImageLayout lay, VkBuffer buf, uint32_t n, const VkBufferImageCopy *r) {
@@ -481,6 +489,7 @@ static void run(uint32_t op, void *p) {
     }
     case OP_PipelineBarrier2: { ARG(PipelineBarrier2A); vkCmdPipelineBarrier2(a->cb, &a->d); break; }
     case OP_CopyBufferToImage: { ARG(BufImgA); vkCmdCopyBufferToImage(a->cb, a->buf, a->img, a->lay, a->n, a->r); break; }
+    case OP_CopyBuffer: { ARG(BufBufA); vkCmdCopyBuffer(a->cb, a->src, a->dst, a->n, a->r); break; }
     case OP_CopyImageToBuffer: { ARG(BufImgA); vkCmdCopyImageToBuffer(a->cb, a->img, a->lay, a->buf, a->n, a->r); break; }
     case OP_EndRendering: { ARG(CbA); vkCmdEndRendering(a->cb); break; }
     case OP_Draw: { ARG(DrawA); vkCmdDraw(a->cb, a->v[0], a->v[1], a->v[2], a->v[3]); break; }

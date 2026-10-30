@@ -212,6 +212,7 @@ void vr_CmdClearDepthStencilImage(CB_, VkImage img, VkImageLayout lay, const VkC
 void vr_CmdClearAttachments(CB_, uint32_t na, const VkClearAttachment *at, uint32_t nr, const VkClearRect *r);
 void vr_CmdBindVertexBuffers(CB_, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o);
 void vr_CmdBindIndexBuffer(CB_, VkBuffer b, VkDeviceSize o, VkIndexType t);
+void vr_CmdCopyBuffer(CB_, VkBuffer src, VkBuffer dst, uint32_t n, const VkBufferCopy *r);
 #undef CB_
 VkResult vr_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi);
 VkResult vr_EndCommandBuffer(VkCommandBuffer cb);
@@ -261,6 +262,7 @@ VkResult vr_DeviceWaitIdle(VkDevice d);
 #define vkCmdClearAttachments vr_CmdClearAttachments
 #define vkCmdBindVertexBuffers vr_CmdBindVertexBuffers
 #define vkCmdBindIndexBuffer vr_CmdBindIndexBuffer
+#define vkCmdCopyBuffer vr_CmdCopyBuffer
 #define vkBeginCommandBuffer vr_BeginCommandBuffer
 #define vkEndCommandBuffer vr_EndCommandBuffer
 #define vkAllocateCommandBuffers vr_AllocateCommandBuffers
