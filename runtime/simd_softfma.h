@@ -252,6 +252,22 @@ __attribute__((noinline)) static float simd_soft_fma_s(float x, float y, float z
     }
     return simd_soft_fma_s_full(x, y, z);
 }
+// The common case in the game code itself (simd_fp.h SIMD_FMA), with zero operands taken as simd_soft_fma_s4 takes
+// them; the call only for the rest. The call alone measured no slower in a loop, but in the game every float live
+// across it is spilled (no callee-saved XMM registers). -DSFMA_NO_INLINE_S: the call always.
+__attribute__((always_inline)) static inline float simd_soft_fma_s_in(float x, float y, float z) {
+    uint32_t ux, uy, uz;
+    memcpy(&ux, &x, 4), memcpy(&uy, &y, 4), memcpy(&uz, &z, 4);
+    int ok = ((((ux >> 23) & 0xff) - 1u < 254u) | !(ux << 1)) & ((((uy >> 23) & 0xff) - 1u < 254u) | !(uy << 1)) &
+             ((((uz >> 23) & 0xff) - 1u < 254u) | !(uz << 1));
+    double p = (double)x * (double)y;
+    double s = p + (double)z;
+    uint64_t u;
+    memcpy(&u, &s, 8);
+    ok &= ((u & 0x1fffffffu) != 0x10000000u && ((u >> 52) & 0x7ff) >= 1023 - 126) | !(u << 1);
+    if (__builtin_expect(ok && !sfma_rc, 1)) return (float)s;
+    return simd_soft_fma_s(x, y, z);
+}
 // The same for a vector of four: the four products and sums at once in doubles (the Jaguar's AVX), with zero
 // operands too (0*y + z is z or the zero its signs give, x*y + 0 the product rounded once); simd_soft_fma_s a lane at
 // a time only when one of them can't take that path. One call where there were four (inline measured barely faster,

@@ -63,8 +63,15 @@ SI VT FN(vsoft_fma)(VT x, VT y, VT z) {
     for (int i = 0; i < NL; i++) r[i] = FN(simd_soft_fma)(x[i], y[i], z[i]);
     return r;
 }
+SI T FN(soft_fma1)(T x, T y, T z) {
+#if defined(SFMA_RC_MIRROR) && NB == 32 && !defined(SFMA_NO_INLINE_S)
+    return simd_soft_fma_s_in(x, y, z);
+#else
+    return FN(simd_soft_fma)(x, y, z);
+#endif
+}
 #ifndef SIMD_FMA
-#define SIMD_FMA(x, y, z) _Generic((x), T: FN(simd_soft_fma), VT: FN(vsoft_fma))(x, y, z)
+#define SIMD_FMA(x, y, z) _Generic((x), T: FN(soft_fma1), VT: FN(vsoft_fma))(x, y, z)
 #endif
 #elif !defined(SIMD_FMA)
 #define SIMD_FMA(x, y, z) __builtin_elementwise_fma(x, y, z)
