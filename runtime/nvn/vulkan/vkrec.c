@@ -30,7 +30,8 @@ enum {
     OP_SetPrimitiveTopology, OP_SetPrimitiveRestartEnable, OP_SetLineWidth, OP_SetFrontFace, OP_SetDepthCompareOp,
     OP_SetDepthBiasEnable, OP_SetDepthBias, OP_SetCullMode, OP_SetBlendConstants, OP_CopyImage, OP_ClearColorImage,
     OP_ClearAttachments, OP_BindVertexBuffers, OP_ResolveImage, OP_EndQuery, OP_DrawIndexed, OP_Dispatch,
-    OP_ClearDepthStencilImage, OP_BindIndexBuffer, OP_BeginQuery, OP_CopyBuffer,
+    OP_ClearDepthStencilImage, OP_BindIndexBuffer, OP_BeginQuery, OP_CopyBuffer, OP_BeginCommandBuffer,
+    OP_EndCommandBuffer, OP_QueueSubmit2,
 };
 typedef struct { uint32_t op, size; } Hdr;  // size: the whole entry, a multiple of 16
 
@@ -464,14 +465,49 @@ void vr_CmdBindIndexBuffer(CB, VkBuffer b, VkDeviceSize o, VkIndexType t) {
     rec_commit();
 }
 
-// ---------------------------------------------------------------- calls that need the commands recorded first
-VkResult vr_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) { vr_sync(); return vkBeginCommandBuffer(cb, bi); }
-VkResult vr_EndCommandBuffer(VkCommandBuffer cb) { vr_sync(); return vkEndCommandBuffer(cb); }
+// ---------------------------------------------------------------- command buffers and submits
+// Beginning and ending a command buffer, and a submit that only signals the timeline (the submissions of a frame but
+// its last), go into the ring too: each waited for the ring to empty, ~6% of the PS4's queue thread in the open world
+// (~6 submits a frame). A submit waiting for or signalling a binary semaphore (the frame's last: the present waits for
+// it, which must come after the real submit) still waits, as does anything with a pNext. Their errors are fatal here
+// as they were for the callers. A wait for the timeline needs nothing more: the submit is put before it and the
+// recording thread is woken for it at once.
+typedef struct { CB; VkCommandBufferUsageFlags flags; } BeginCommandBufferA;
+VkResult vr_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) {
+    if (!vr_enabled() || bi->pNext || bi->pInheritanceInfo) { vr_sync(); return vkBeginCommandBuffer(cb, bi); }
+    BeginCommandBufferA *a = rec_begin(OP_BeginCommandBuffer, sizeof *a);
+    *a = (BeginCommandBufferA){cb, bi->flags};
+    rec_commit();
+    return VK_SUCCESS;
+}
+typedef struct { CB; } EndCommandBufferA;
+VkResult vr_EndCommandBuffer(VkCommandBuffer cb) {
+    if (!vr_enabled()) return vkEndCommandBuffer(cb);
+    EndCommandBufferA *a = rec_begin(OP_EndCommandBuffer, sizeof *a);
+    *a = (EndCommandBufferA){cb};
+    rec_commit();
+    return VK_SUCCESS;
+}
 VkResult vr_AllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *cb) {
     vr_sync();
     return vkAllocateCommandBuffers(d, ai, cb);
 }
-VkResult vr_QueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence f) { vr_sync(); return vkQueueSubmit2(q, n, si, f); }
+#define SUBMIT_CBS 8
+typedef struct { VkQueue q; uint32_t ncb; VkCommandBufferSubmitInfo cbs[SUBMIT_CBS]; VkSemaphoreSubmitInfo sig; uint32_t nsig; } QueueSubmit2A;
+VkResult vr_QueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence f) {
+    bool plain = vr_enabled() && n == 1 && !f && !si->pNext && !si->flags && !si->waitSemaphoreInfoCount &&
+                 si->signalSemaphoreInfoCount <= 1 && si->commandBufferInfoCount <= SUBMIT_CBS;
+    for (uint32_t i = 0; plain && i < si->commandBufferInfoCount; i++) plain = !si->pCommandBufferInfos[i].pNext;
+    if (plain && si->signalSemaphoreInfoCount) plain = !si->pSignalSemaphoreInfos[0].pNext;
+    if (!plain) { vr_sync(); return vkQueueSubmit2(q, n, si, f); }
+    QueueSubmit2A *a = rec_begin(OP_QueueSubmit2, sizeof *a);
+    a->q = q, a->ncb = si->commandBufferInfoCount, a->nsig = si->signalSemaphoreInfoCount;
+    memcpy(a->cbs, si->pCommandBufferInfos, a->ncb * sizeof a->cbs[0]);
+    if (a->nsig) a->sig = si->pSignalSemaphoreInfos[0];
+    rec_commit();
+    wake();
+    return VK_SUCCESS;
+}
 VkResult vr_QueueWaitIdle(VkQueue q) { vr_sync(); return vkQueueWaitIdle(q); }
 VkResult vr_DeviceWaitIdle(VkDevice d) { vr_sync(); return vkDeviceWaitIdle(d); }
 
@@ -490,6 +526,28 @@ static void run(uint32_t op, void *p) {
     case OP_PipelineBarrier2: { ARG(PipelineBarrier2A); vkCmdPipelineBarrier2(a->cb, &a->d); break; }
     case OP_CopyBufferToImage: { ARG(BufImgA); vkCmdCopyBufferToImage(a->cb, a->buf, a->img, a->lay, a->n, a->r); break; }
     case OP_CopyBuffer: { ARG(BufBufA); vkCmdCopyBuffer(a->cb, a->src, a->dst, a->n, a->r); break; }
+    case OP_BeginCommandBuffer: {
+        ARG(BeginCommandBufferA);
+        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = a->flags};
+        VkResult r = vkBeginCommandBuffer(a->cb, &bi);
+        if (r != VK_SUCCESS) FATAL("[vk] vkrec: vkBeginCommandBuffer: %d\n", r);
+        break;
+    }
+    case OP_EndCommandBuffer: {
+        ARG(EndCommandBufferA);
+        VkResult r = vkEndCommandBuffer(a->cb);
+        if (r != VK_SUCCESS) FATAL("[vk] vkrec: vkEndCommandBuffer: %d\n", r);
+        break;
+    }
+    case OP_QueueSubmit2: {
+        ARG(QueueSubmit2A);
+        VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->ncb, .pCommandBufferInfos = a->cbs,
+                            .signalSemaphoreInfoCount = a->nsig, .pSignalSemaphoreInfos = &a->sig};
+        VkResult r = vkQueueSubmit2(a->q, 1, &si, VK_NULL_HANDLE);
+        if (r == VK_ERROR_DEVICE_LOST) { extern void vk_devlost_dump(void); vk_devlost_dump(); }
+        if (r != VK_SUCCESS) FATAL("[vk] vkrec: vkQueueSubmit2: %d\n", r);
+        break;
+    }
     case OP_CopyImageToBuffer: { ARG(BufImgA); vkCmdCopyImageToBuffer(a->cb, a->img, a->lay, a->buf, a->n, a->r); break; }
     case OP_EndRendering: { ARG(CbA); vkCmdEndRendering(a->cb); break; }
     case OP_Draw: { ARG(DrawA); vkCmdDraw(a->cb, a->v[0], a->v[1], a->v[2], a->v[3]); break; }
