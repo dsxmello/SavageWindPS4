@@ -44,7 +44,8 @@ uint64_t sceKernelGetTscFrequency(void);
 int32_t sceKernelAvailableDirectMemorySize(off_t search_start, off_t search_end, size_t alignment, off_t *physical_out,
                                            size_t *size_out);
 void ac_ps4_get_memory(uint64_t *garlic_bytes, uint64_t *onion_bytes, uint64_t *buffers);  // (RADV, ac_ps4_drm.c)
-void ps4_heap_usage(size_t *main_mb, size_t *overflow_mb, size_t *overflow_cap_mb);  // (ps4/ps4_runtime.cpp)
+void ps4_heap_usage(size_t *main_mb, size_t *overflow_mb, size_t *overflow_cap_mb, size_t *used_mb);
+void ps4_heap_top(char *out, size_t cap);  // (ps4/ps4_runtime.cpp: sampled heap profile)  // (ps4/ps4_runtime.cpp)
 uint32_t nvn_texture_count(uint32_t *inits);                                        // (nvn/objects.c)
 
 #define SCE_KERNEL_WB_ONION 0      // CPU cached, GPU coherent: the guest's memory is mostly CPU work
@@ -391,16 +392,19 @@ static void log_memory(const char *why) {
     size_t big = 0;
     if (sceKernelAvailableDirectMemorySize(0, (off_t)sceKernelGetDirectMemorySize(), CHUNK, &at, &big) != 0) big = 0;
     // (the host heap: 512 MB of system flexible memory, then an overflow heap in direct memory; full = abort)
-    size_t heap = 0, over = 0, over_cap = 0;
-    ps4_heap_usage(&heap, &over, &over_cap);
+    size_t heap = 0, over = 0, over_cap = 0, used = 0;
+    ps4_heap_usage(&heap, &over, &over_cap, &used);
     uint32_t tex_inits = 0, tex = nvn_texture_count(&tex_inits);
-    fprintf(stderr, "[plat] memory%s: host heap %zu MB + overflow %zu of %zu MB (%u textures of %u inits), guest %llu MB, stacks %llu MB (%d; deepest used: guest threads %llu KB, host "
+    fprintf(stderr, "[plat] memory%s: host heap %zu MB + overflow %zu of %zu MB, %zu MB in use (%u textures of %u inits), guest %llu MB, stacks %llu MB (%d; deepest used: guest threads %llu KB, host "
             "threads %llu KB), GPU %llu MB garlic + %llu MB onion (%llu buffers), largest free block %llu MB of %llu MB\n",
-            why, heap, over, over_cap, tex, tex_inits, (unsigned long long)(atomic_load(&g_backed) >> 20), (unsigned long long)(atomic_load(&g_stack_bytes) >> 20),
+            why, heap, over, over_cap, used, tex, tex_inits, (unsigned long long)(atomic_load(&g_backed) >> 20), (unsigned long long)(atomic_load(&g_stack_bytes) >> 20),
             atomic_load(&g_nstacks), (unsigned long long)(stack_used_max(true) >> 10),
             (unsigned long long)(stack_used_max(false) >> 10), (unsigned long long)(garlic >> 20),
             (unsigned long long)(onion >> 20), (unsigned long long)bufs, (unsigned long long)(big >> 20),
             (unsigned long long)(sceKernelGetDirectMemorySize() >> 20));
+    char top[600];
+    ps4_heap_top(top, sizeof top);
+    fprintf(stderr, "[plat] heap by caller (sampled, MB):%s\n", top);
 }
 
 static void *hang_watch(void *arg) {

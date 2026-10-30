@@ -409,6 +409,73 @@ void ps4_heap_error(void* msp, void* chunk, int corruption) {
         abort();
 }
 
+// Bytes the program holds (usable sizes, arenas' allocations included): what "[plat] memory" says is in use. The
+// heaps' footprints only grow (the overflow heap showed 512 of 512 MB from its first minutes), so a heap about to
+// run out (the instrumented PGO build in Kakariko) didn't show.
+static size_t g_heapUsed = 0;
+static inline void usedAdd(void* p) {
+    if (p)
+        __atomic_add_fetch(&g_heapUsed, mspace_usable_size(p), __ATOMIC_RELAXED);
+}
+static inline void usedSub(void* p) { __atomic_sub_fetch(&g_heapUsed, mspace_usable_size(p), __ATOMIC_RELAXED); }
+
+// Sampled heap profile ("[plat] heap by caller" lines): the allocation that crosses each MB allocated is kept with its
+// caller and a weight of 1 MB per crossing until it is freed, so the live weights per caller estimate what each holds.
+// A free looks in the table only when its pointer's bit is set (bits are never cleared: a stale one costs a lookup).
+#define HP_PERIOD (1ull << 20)
+#define HP_CAP 16384
+#define HP_PROBE 64
+struct HpEnt {
+    void* p;  // (null: empty; HP_GONE: freed)
+    const void* caller;
+    uint32_t weight;
+};
+#define HP_GONE ((void*)1)
+static HpEnt g_hp[HP_CAP];
+static uint64_t g_hpBits[1024];
+static pthread_mutex_t g_hpLock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_hpBytes;
+static inline uint32_t hpHash(const void* p) {
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x = (x ^ (x >> 17)) * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(x >> 40);
+}
+static void hpNote(void* p, size_t n, const void* caller) {
+    if (!p)
+        return;
+    const uint64_t before = __atomic_fetch_add(&g_hpBytes, n, __ATOMIC_RELAXED);
+    const uint32_t k = (uint32_t)((before + n) / HP_PERIOD - before / HP_PERIOD);
+    if (!k)
+        return;
+    const uint32_t h = hpHash(p);
+    pthread_mutex_lock(&g_hpLock);
+    for (uint32_t i = 0; i < HP_PROBE; i++) {
+        HpEnt* e = &g_hp[(h + i) & (HP_CAP - 1)];
+        if (e->p == nullptr || e->p == HP_GONE) {
+            *e = HpEnt{p, caller, k};
+            __atomic_or_fetch(&g_hpBits[(h >> 6) & 1023], 1ull << (h & 63), __ATOMIC_RELAXED);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_hpLock);
+}
+static void hpForget(const void* p) {
+    const uint32_t h = hpHash(p);
+    if (!((__atomic_load_n(&g_hpBits[(h >> 6) & 1023], __ATOMIC_RELAXED) >> (h & 63)) & 1))
+        return;
+    pthread_mutex_lock(&g_hpLock);
+    for (uint32_t i = 0; i < HP_PROBE; i++) {
+        HpEnt* e = &g_hp[(h + i) & (HP_CAP - 1)];
+        if (e->p == p) {
+            e->p = HP_GONE;
+            break;
+        }
+        if (e->p == nullptr)
+            break;
+    }
+    pthread_mutex_unlock(&g_hpLock);
+}
+
 void* __wrap_malloc(size_t size) {
     t_op = "malloc";
     t_caller = __builtin_return_address(0);
@@ -421,6 +488,8 @@ void* __wrap_malloc(size_t size) {
             p = mspace_malloc(overflow, size);
     if (!p)
         reportFailure("malloc", size);
+    usedAdd(p);
+    hpNote(p, size, t_caller);
     return p;
 }
 
@@ -438,6 +507,8 @@ void __wrap_free(void* ptr) {
         }
         return;
     }
+    usedSub(ptr);
+    hpForget(ptr);
     mspace_free(getHeap(), ptr);
 }
 
@@ -453,6 +524,8 @@ void* __wrap_calloc(size_t nelem, size_t size) {
             p = mspace_calloc(overflow, nelem, size);
     if (!p)
         reportFailure("calloc", nelem * size);
+    usedAdd(p);
+    hpNote(p, nelem * size, t_caller);
     return p;
 }
 
@@ -467,9 +540,12 @@ void* __wrap_realloc(void* ptr, size_t size) {
         return nullptr;
     }
     if (ptr && size == 0) {
+        usedSub(ptr);
+        hpForget(ptr);
         mspace_free(getHeap(), ptr);
         return nullptr;
     }
+    const size_t old_used = ptr ? mspace_usable_size(ptr) : 0;
     // With FOOTERS this grows the chunk inside the arena it came from (the mspace argument is
     // only used for new allocations); when that arena is full, move it to this thread's.
     void* p = ptr ? mspace_realloc(getHeap(), ptr, size) : nullptr;
@@ -488,6 +564,13 @@ void* __wrap_realloc(void* ptr, size_t size) {
     }
     if (!p)
         reportFailure("realloc", size);
+    if (p) {
+        __atomic_sub_fetch(&g_heapUsed, old_used, __ATOMIC_RELAXED);
+        usedAdd(p);
+        if (ptr)
+            hpForget(ptr);
+        hpNote(p, size, t_caller);
+    }
     return p;
 }
 
@@ -503,6 +586,8 @@ void* __wrap_memalign(size_t alignment, size_t size) {
             p = mspace_memalign(overflow, alignment, size);
     if (!p)
         reportFailure("memalign", size);
+    usedAdd(p);
+    hpNote(p, size, t_caller);
     return p;
 }
 
@@ -607,11 +692,45 @@ int ps4_replace_malloc_stats(void* out) {
     return 0;
 }
 // Memory the heaps took from the system so far (dlmalloc's footprint: what was ever in use, it doesn't shrink), MiB
-void ps4_heap_usage(size_t* main_mb, size_t* overflow_mb, size_t* overflow_cap_mb) {
+void ps4_heap_usage(size_t* main_mb, size_t* overflow_mb, size_t* overflow_cap_mb, size_t* used_mb) {
+    *used_mb = __atomic_load_n(&g_heapUsed, __ATOMIC_RELAXED) / MB;
     *main_mb = g_heap ? mspace_footprint(g_heap) / MB : 0;
     mspace overflow = __atomic_load_n(&g_overflow, __ATOMIC_ACQUIRE);
     *overflow_mb = overflow ? mspace_footprint(overflow) / MB : 0;
     *overflow_cap_mb = g_overflowSize / MB;
+}
+
+// The callers holding the most sampled memory: "elf 0x<eboot offset> N MB" each (llvm-symbolizer on the .oelf)
+void ps4_heap_top(char* out, size_t cap) {
+    struct Agg { const void* caller; uint64_t mb; };
+    static Agg agg[512];
+    int n = 0;
+    pthread_mutex_lock(&g_hpLock);
+    for (const HpEnt& e : g_hp) {
+        if (e.p == nullptr || e.p == HP_GONE)
+            continue;
+        int k = 0;
+        while (k < n && agg[k].caller != e.caller)
+            k++;
+        if (k == n) {
+            if (n == 512)
+                continue;
+            agg[n++] = Agg{e.caller, 0};
+        }
+        agg[k].mb += e.weight;
+    }
+    pthread_mutex_unlock(&g_hpLock);
+    size_t at = 0;
+    out[0] = 0;
+    for (int t = 0; t < 10 && n; t++) {
+        int best = 0;
+        for (int k = 1; k < n; k++)
+            if (agg[k].mb > agg[best].mb)
+                best = k;
+        at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, " elf 0x%llx %llu MB;", elf(agg[best].caller),
+                               (unsigned long long)agg[best].mb);
+        agg[best] = agg[--n];
+    }
 }
 int ps4_replace_malloc_stats_fast(void* out) { return ps4_replace_malloc_stats(out); }
 size_t ps4_replace_malloc_usable_size(void* ptr) { return ptr ? mspace_usable_size(ptr) : 0; }

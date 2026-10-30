@@ -40,6 +40,7 @@ typedef struct Shadow {
     int nblocks, cap;
     int users;        // command buffers recording into it
     bool dead;        // overlapped: out of the live list (freed when its last user leaves)
+    uint64_t rec_bytes;  // (SAVAGEWIND_CMD_STATS) record bytes written, as of the last command buffer there
 } Shadow;
 
 static Shadow **g_live;  // shadows of guest memory, sorted by lo, never overlapping
@@ -72,11 +73,13 @@ static HBlock block_get(uint64_t want) {  // (lock held) a free block that fits 
     static uint64_t stats_at;
     if (stats < 0) stats = getenv("SAVAGEWIND_CMD_STATS") != NULL;
     if (stats && now >= stats_at) {  // (test) what the command records hold, every 600 frames
-        uint64_t live = 0;
-        for (int i = 0; i < g_nlive; i++)
+        uint64_t live = 0, used = 0;
+        for (int i = 0; i < g_nlive; i++) {
+            used += g_live[i]->rec_bytes;
             for (int j = 0; j < g_live[i]->nblocks; j++) live += g_live[i]->blocks[j].size;
-        LOG("[cmdbuf] frame %llu: %d lists' shadows, %llu MB of records; %d free blocks, %llu MB\n",
-            (unsigned long long)now, g_nlive, (unsigned long long)(live >> 20), g_nfree,
+        }
+        LOG("[cmdbuf] frame %llu: %d lists' shadows, %llu MB of records (%llu MB written); %d free blocks, %llu MB\n",
+            (unsigned long long)now, g_nlive, (unsigned long long)(live >> 20), (unsigned long long)(used >> 20), g_nfree,
             (unsigned long long)(g_free_bytes >> 20));
         stats_at = now + 600;
     }
@@ -240,9 +243,10 @@ NVN(nvnCommandBufferInitialize) {
     SET_HOST(A(0), cb);
     RET(1);
 }
+static void note_rec_bytes(NvnCmdBuf *cb);
 NVN(nvnCommandBufferFinalize) {
     NvnCmdBuf *cb = cb_of(A(0));
-    if (cb && cb->shadow) shadow_leave(cb->shadow, cb->gused);
+    if (cb && cb->shadow) note_rec_bytes(cb), shadow_leave(cb->shadow, cb->gused);
     free(cb);
     SET_HOST(A(0), 0);
 }
@@ -270,13 +274,25 @@ static void use_block(NvnCmdBuf *cb, int i, uint64_t want) {
     cb->used = 0;
 }
 
+static void note_rec_bytes(NvnCmdBuf *cb) {  // (SAVAGEWIND_CMD_STATS) what the command buffer wrote in its shadow
+    Shadow *sh = cb->shadow;
+    if (!sh || sh->dead) return;
+    uint64_t b = cb->used;
+    for (int i = 0; i < cb->block && i < sh->nblocks; i++) b += sh->blocks[i].size;
+    if (b > sh->rec_bytes) sh->rec_bytes = b;
+}
+
+// A shadow's first block is 1 KB, whatever the memory the game adds: more blocks chain on when needed, each twice the
+// last. It used to be eight times the guest bytes up to 16 KB, and BOTW adds far more than it records (often a few
+// hundred bytes in a window of hundreds of KB): in the open world ~46000 lists' shadows held 377 MB of blocks for 27 MB
+// of records, and the PS4's 1 GB host heap ran out after 8-20 minutes (Kakariko).
 static void use_guest_chunk(NvnCmdBuf *cb, uint64_t gmem, uint64_t gsize) {
+    note_rec_bytes(cb);
     cb->shadow = shadow_switch(cb->shadow, cb->gused, cb->recording, gmem, gmem ? gmem + gsize : 0);
     cb->gmem = gmem;
     cb->gsize = gsize;
     cb->gused = 0;
-    uint64_t want = gsize * 8;  // (records take several times the GPU bytes; more blocks chain on when needed, each
-    use_block(cb, 0, want < 0x400 ? 0x400 : want > 0x4000 ? 0x4000 : want);  // twice the last: start small)
+    use_block(cb, 0, 0x400);
 }
 
 NVN(nvnCommandBufferAddCommandMemory) {  // (cmd, pool, offset, size)
@@ -351,6 +367,7 @@ NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     rec_cost(c, cb, CMD_END, 0, 0);
     cb->recording = false;
+    note_rec_bytes(cb);
     TL("recorded %llx", (unsigned long long)A(0));
     RET(cb->start);
 }
