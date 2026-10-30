@@ -3599,17 +3599,23 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
 static SetEnt *setc;
 
+// Before the table: the last set of each layout (by a few slots), kept with its writes. ~85% of the draws in BOTW's
+// open world bind the same set for a stage as the draw before (only their dynamic offsets change), and comparing
+// ~700 hot bytes costs less than the two hashes and the probe (~5% of the PS4's queue thread).
+#define SETL_SLOTS 16
+static struct { VkDescriptorSetLayout layout; uint64_t seq; uint32_t n; VkDescriptorSet set; uint64_t key[MAX_BIND][4]; } setl[SETL_SLOTS];
+
 static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_VK_NO_SET_CACHE") != NULL;
     stat_sets++;
     SetEnt *e = NULL;
+    __typeof__(setl[0]) *l = NULL;
     uint64_t seq = vk_pending_seq() + (setc_gen << 40), h = 0, h2 = 0;
-    if (!off) {
-        h = (uint64_t)(uintptr_t)layout;
-        h2 = h ^ 0x6A09E667F3BCC909ull;
+    if (!off && n <= MAX_BIND) {
+        uint64_t key[MAX_BIND][4];
         for (int i = 0; i < n; i++) {
-            uint64_t v[4];
+            uint64_t *v = key[i];
             v[0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
             if (w[i].pImageInfo) {
                 v[1] = (uint64_t)(uintptr_t)w[i].pImageInfo->sampler;
@@ -3620,16 +3626,28 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
                 v[2] = w[i].pBufferInfo->offset;
                 v[3] = w[i].pBufferInfo->range;
             }
-            for (int k = 0; k < 4; k++) {
-                h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-                h2 = (h2 ^ v[k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
-            }
         }
+        uint64_t lh = (uint64_t)(uintptr_t)layout;
+        l = &setl[(lh ^ (lh >> 7) ^ (lh >> 13)) & (SETL_SLOTS - 1)];
+        if (l->layout == layout && l->seq == seq && l->n == (uint32_t)n && !memcmp(l->key, key, (size_t)n * sizeof key[0])) {
+            stat_sets_reused++;
+            return l->set;
+        }
+        h = lh;
+        h2 = h ^ 0x6A09E667F3BCC909ull;
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < 4; k++) {
+                h = (h ^ key[i][k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+                h2 = (h2 ^ key[i][k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
+            }
         h ^= h >> 32;
+        l->layout = layout; l->seq = seq; l->n = (uint32_t)n;
+        memcpy(l->key, key, (size_t)n * sizeof key[0]);
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);
         e = &setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
         if (e->seq == seq && e->hash == h && e->hash2 == h2 && e->layout == layout && e->n == (uint32_t)n) {
             stat_sets_reused++;
+            l->set = e->set;
             return e->set;
         }
     }
@@ -3640,6 +3658,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
         e->hash = h; e->hash2 = h2; e->layout = layout; e->set = ds; e->n = (uint32_t)n;
     }
+    if (l) l->set = ds;
     return ds;
 }
 
