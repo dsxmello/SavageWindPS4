@@ -206,6 +206,7 @@ static bool async_exec(void) {
 // present ends: the main thread's VFR update and its GPU wait (nvnSyncWait), the submit, the list's translation, the
 // present's turn (cheap enough to leave the timing alone, unlike SAVAGEWIND_TIMELINE)
 uint64_t g_fs_vfr, g_fs_sync0, g_fs_sync1, g_fs_submit, g_fs_x0, g_fs_x1, g_fs_pace;
+static uint64_t g_fs_qwait, g_fs_gwait, g_fs_waits;  // this frame's nvnSyncWaits: count, time for the queue, for the GPU
 static int frame_split(void) {
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) == 2;
@@ -214,8 +215,10 @@ static int frame_split(void) {
 static void frame_split_log(void) {
     uint64_t now = plat_now_ns();
     #define FS(t) ((t) ? ((double)now - (double)(t)) / 1e6 : -1.0)
-    LOG("[fsplit] %.3f vfr %.1f sync %.1f-%.1f submit %.1f exec %.1f-%.1f pace %.1f\n", now / 1e6, FS(g_fs_vfr),
-        FS(g_fs_sync0), FS(g_fs_sync1), FS(g_fs_submit), FS(g_fs_x0), FS(g_fs_x1), FS(g_fs_pace));
+    LOG("[fsplit] %.3f vfr %.1f sync %.1f-%.1f submit %.1f exec %.1f-%.1f pace %.1f waits %llu: queue %.1f gpu %.1f\n", now / 1e6,
+        FS(g_fs_vfr), FS(g_fs_sync0), FS(g_fs_sync1), FS(g_fs_submit), FS(g_fs_x0), FS(g_fs_x1), FS(g_fs_pace),
+        (unsigned long long)g_fs_waits, g_fs_qwait / 1e6, g_fs_gwait / 1e6);
+    g_fs_waits = g_fs_qwait = g_fs_gwait = 0;
     #undef FS
 }
 
@@ -369,14 +372,17 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
        (unsigned long long)s->seq, (unsigned long long)s->ticket, (unsigned long long)renderer_fence_seq(),
        (unsigned long long)vk_completed_seq(), (unsigned long long)c->x[30]);
     // the queue first: up to the fence that sets it (a fence inside a command list: everything submitted so far)
-    if (frame_split() && s->ticket) g_fs_sync0 = plat_now_ns();
+    uint64_t tq0 = frame_split() ? plat_now_ns() : 0;
+    if (frame_split() && s->ticket) g_fs_sync0 = tq0;
     if (async_exec()) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
+    uint64_t tq1 = frame_split() ? plat_now_ns() : 0;
     if (host_work()) kernel_host_work_begin();
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
     else renderer_wait_seq(s->seq);  // only the submission that holds this fence
     if (host_work()) kernel_host_work_end();
     if (frame_split() && s->ticket) g_fs_sync1 = plat_now_ns();
+    if (frame_split()) { g_fs_waits++; g_fs_qwait += tq1 - tq0; g_fs_gwait += plat_now_ns() - tq1; }
     TL("syncwait done");
     RET(0);
 }
