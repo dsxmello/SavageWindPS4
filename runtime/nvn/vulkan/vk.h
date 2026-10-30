@@ -213,6 +213,7 @@ void vr_CmdClearAttachments(CB_, uint32_t na, const VkClearAttachment *at, uint3
 void vr_CmdBindVertexBuffers(CB_, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o);
 void vr_CmdBindIndexBuffer(CB_, VkBuffer b, VkDeviceSize o, VkIndexType t);
 void vr_CmdCopyBuffer(CB_, VkBuffer src, VkBuffer dst, uint32_t n, const VkBufferCopy *r);
+void vr_UpdateDescriptorSets(VkDevice d, uint32_t n, const VkWriteDescriptorSet *w);  // (no copies; vkrec.c)
 #undef CB_
 VkResult vr_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi);
 VkResult vr_EndCommandBuffer(VkCommandBuffer cb);

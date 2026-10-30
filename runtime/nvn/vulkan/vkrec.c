@@ -31,7 +31,7 @@ enum {
     OP_SetDepthBiasEnable, OP_SetDepthBias, OP_SetCullMode, OP_SetBlendConstants, OP_CopyImage, OP_ClearColorImage,
     OP_ClearAttachments, OP_BindVertexBuffers, OP_ResolveImage, OP_EndQuery, OP_DrawIndexed, OP_Dispatch,
     OP_ClearDepthStencilImage, OP_BindIndexBuffer, OP_BeginQuery, OP_CopyBuffer, OP_BeginCommandBuffer,
-    OP_EndCommandBuffer, OP_QueueSubmit2,
+    OP_EndCommandBuffer, OP_QueueSubmit2, OP_UpdateDescriptorSets,
 };
 typedef struct { uint32_t op, size; } Hdr;  // size: the whole entry, a multiple of 16
 
@@ -465,6 +465,28 @@ void vr_CmdBindIndexBuffer(CB, VkBuffer b, VkDeviceSize o, VkIndexType t) {
     rec_commit();
 }
 
+// Descriptor set writes (set_finish), ~2% of the PS4's queue thread inside RADV: a set is written once, just
+// allocated, before any command binding it, and those binds come after this in the ring. A write with a pNext or
+// texel buffer views is made at once, after the ring.
+typedef struct { VkDevice d; uint32_t n; VkWriteDescriptorSet *w; } UpdateDescriptorSetsA;
+void vr_UpdateDescriptorSets(VkDevice d, uint32_t n, const VkWriteDescriptorSet *w) {
+    size_t extra = A8(n * sizeof *w);
+    bool plain = vr_enabled();
+    for (uint32_t i = 0; plain && i < n; i++) {
+        plain = !w[i].pNext && !w[i].pTexelBufferView;
+        extra += A8(w[i].descriptorCount * (w[i].pImageInfo ? sizeof *w[i].pImageInfo : sizeof *w[i].pBufferInfo));
+    }
+    if (!plain) { vr_sync(); vkUpdateDescriptorSets(d, n, w, 0, NULL); return; }
+    UpdateDescriptorSetsA *a = rec_begin(OP_UpdateDescriptorSets, sizeof *a + extra);
+    Cur c = {(uint8_t *)(a + 1)};
+    a->d = d, a->n = n, a->w = cur_put(&c, w, n * sizeof *w);
+    for (uint32_t i = 0; i < n; i++) {
+        if (w[i].pImageInfo) a->w[i].pImageInfo = cur_put(&c, w[i].pImageInfo, w[i].descriptorCount * sizeof *w[i].pImageInfo);
+        if (w[i].pBufferInfo) a->w[i].pBufferInfo = cur_put(&c, w[i].pBufferInfo, w[i].descriptorCount * sizeof *w[i].pBufferInfo);
+    }
+    rec_commit();
+}
+
 // ---------------------------------------------------------------- command buffers and submits
 // Beginning and ending a command buffer, and a submit that only signals the timeline (the submissions of a frame but
 // its last), go into the ring too: each waited for the ring to empty, ~6% of the PS4's queue thread in the open world
@@ -526,6 +548,7 @@ static void run(uint32_t op, void *p) {
     case OP_PipelineBarrier2: { ARG(PipelineBarrier2A); vkCmdPipelineBarrier2(a->cb, &a->d); break; }
     case OP_CopyBufferToImage: { ARG(BufImgA); vkCmdCopyBufferToImage(a->cb, a->buf, a->img, a->lay, a->n, a->r); break; }
     case OP_CopyBuffer: { ARG(BufBufA); vkCmdCopyBuffer(a->cb, a->src, a->dst, a->n, a->r); break; }
+    case OP_UpdateDescriptorSets: { ARG(UpdateDescriptorSetsA); vkUpdateDescriptorSets(a->d, a->n, a->w, 0, NULL); break; }
     case OP_BeginCommandBuffer: {
         ARG(BeginCommandBufferA);
         VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = a->flags};

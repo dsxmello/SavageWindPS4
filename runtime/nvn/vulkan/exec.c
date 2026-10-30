@@ -3635,7 +3635,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
     }
     VkDescriptorSet ds = vk_alloc_set(layout);
     for (int i = 0; i < n; i++) w[i].dstSet = ds;
-    if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+    if (n) vr_UpdateDescriptorSets(g_vk.dev, (uint32_t)n, w);  // (on the recording thread: vkrec.c)
     if (e) {
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
         e->hash = h; e->hash2 = h2; e->layout = layout; e->set = ds; e->n = (uint32_t)n;
