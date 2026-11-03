@@ -479,8 +479,8 @@ class Module:
                 batch.clear()
 
         def jump(t):
-            if entry <= t < end:
-                return f'goto L_{t:x};'
+            if entry <= t < end:  # (a backward branch closes a loop: cpu.h RT_LOOP_BARRIER)
+                return f'{"RT_LOOP_BARRIER; " if t <= here[0] else ""}goto L_{t:x};'
             if not self.in_text(t):
                 return f'c->pc = {hx(t)}; {st(promote.ABI_IN)}RT_TAIL(c);'
             refs.add(t)
@@ -493,7 +493,9 @@ class Module:
             return (f'{st(ALL)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
                     else 'goto L_dispatch;')
         last = None
+        here = [entry]
         for a in range(entry, end, 4):
+            here[0] = a
             ins = self.lift(a)
             if promoted:
                 dirty[0] = f.din[(a - entry) // 4]
@@ -569,7 +571,7 @@ class Module:
         if last not in ('b', 'br', 'ret', 'trap'):
             out.append('    ' + jump(end) if end < self.hi else f'    {st(ALL)}rt_udf(c, {hx(end)});')
         if all_labels:
-            out.append('L_dispatch:')
+            out.append('L_dispatch: RT_LOOP_BARRIER;')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             out.append('    RT_TAIL(c);')
@@ -712,7 +714,7 @@ def generate(name, nso, base, outdir, opts, sites=None):
             if n > opts.big_fn:
                 break
         path = os.path.join(outdir, f'{name}_{nchunks:03d}.c')
-        text = [('#define GUEST_VOL volatile\n' if m.promo else '') + '#include "cpu.h"\n' +
+        text = ['#include "cpu.h"\n' +
                 ('#include "simd.h"\n' if m.lifter.sc else '')]
         if any('rt_setjmp_slot(' in l for l in body):
             text += ['#include <setjmp.h>\njmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf);\n']

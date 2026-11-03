@@ -68,10 +68,13 @@ void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
 #endif
 
-// GUEST_VOL: volatile in code generated with registers in locals (tools/promote.py). There a loop polling memory
-// (ldr; cbz back: a spin wait on another thread's store) has no other store left, and the C compiler hoisted the load
-// out of it (the game hung at start); before, each pass also stored a register to *c, which the load might alias.
-// The guest's loads and stores are its compiler's already: emitting each one as written costs little.
+// GUEST_VOL: empty by default (-DGUEST_VOL=volatile makes every guest load and store volatile again, to compare).
+// With registers in locals (tools/promote.py) a loop polling memory (ldr; cbz back: a spin wait on another thread's
+// store) has no other store left, and the C compiler hoisted the load out of it (the game hung at start). Instead of
+// volatile everywhere, the generator puts RT_LOOP_BARRIER on every backward branch (tools/gen.py): each loop pass
+// reloads memory, also what an inlined callee reads, while straight-line code keeps the compiler's load/store
+// optimizations. (The guest's atomics and barriers are __atomic operations already: cpu.h exclusive monitor, dmb.)
+#define RT_LOOP_BARRIER __asm__ volatile("" ::: "memory")
 #ifndef GUEST_VOL
 #define GUEST_VOL
 #endif
