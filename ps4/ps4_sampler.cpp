@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -91,22 +92,29 @@ uint64_t memCaller(uint64_t rip, uint64_t rsp) {
 // (Savage Wind) The eboot function a sample inside a system module came from: the first eboot return address up the
 // frame pointer chain (the eboot keeps frame pointers; a libkernel leaf leaves rbp alone), tagged with kCallerTag in
 // mem_callers ("sys<-" lines). 0 if the chain leaves the thread's stack or never reaches the eboot.
+// SAVAGEWIND_PS4_SAMPLE_DEPTH=<n>: the n-th eboot return address instead (2: who called the eboot function that
+// called the system, e.g. who called SDL_Delay); the deepest one found if the chain is shorter.
+int g_sysDepth = 0;
 uint64_t sysCaller(uint64_t rbp, uint64_t rsp, uintptr_t stack_top) {
     const uintptr_t text = reinterpret_cast<uintptr_t>(__text_start);
     const uintptr_t text_end = reinterpret_cast<uintptr_t>(__eh_frame_hdr_end);
-    uint64_t fp = rbp;
-    for (int depth = 0; depth < 16; depth++) {
+    uint64_t fp = rbp, found = 0;
+    int seen = 0;
+    for (int depth = 0; depth < 32; depth++) {
         if (fp < rsp || fp + 16 > stack_top || (fp & 7) != 0)
-            return 0;
+            return found;
         const uint64_t* frame = reinterpret_cast<const uint64_t*>(fp);
         const uint64_t ret = frame[1];
-        if (ret >= text && ret < text_end)
-            return (ret - text) | kCallerTag;
+        if (ret >= text && ret < text_end) {
+            found = (ret - text) | kCallerTag;
+            if (++seen >= (g_sysDepth > 1 ? g_sysDepth : 1))
+                return found;
+        }
         if (frame[0] <= fp)
-            return 0;
+            return found;
         fp = frame[0];
     }
-    return 0;
+    return found;
 }
 
 ThreadSamples g_threads[kMaxThreads];
@@ -641,6 +649,8 @@ extern "C" void ps4_sampler_start() {
     g_sampler_on.store(true);
     if (s_started.exchange(true))
         return;
+    if (const char* d = getenv("SAVAGEWIND_PS4_SAMPLE_DEPTH"))
+        g_sysDepth = atoi(d);
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     void (*handler)(int, siginfo_t*, void*) = profHandler;
