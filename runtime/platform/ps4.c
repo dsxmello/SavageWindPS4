@@ -215,11 +215,26 @@ static void pin_init(void) {
     plat_log("[plat] cpus 0x%llx (result 0x%x), policy %d prio %d: pinning %s\n", (unsigned long long)m, r, pol,
              sp.sched_priority, g_cpus ? "on" : "off");
 }
-// role: 0 a guest thread, 1 the queue thread, 2 vkrec, -1 any other host thread
+// (test) SAVAGEWIND_PS4_PIN_MAIN / _GUEST / _QUEUE / _VKREC=<hex CPU mask>: other placements. The clusters don't share
+// an L2: what one writes, the other reads through memory (the game's threads write the command and constant data the
+// queue thread reads).
+static uint64_t pin_mask(const char *name, uint64_t def) {
+    const char *e = getenv(name);
+    uint64_t m = e && *e ? strtoull(e, NULL, 16) & g_cpus : 0;
+    return m ? m : def;
+}
+// role: 0 a guest thread, 3 the game's main thread, 1 the queue thread, 2 vkrec, -1 any other host thread
 void ps4_pin_thread(int role) {
     pthread_once(&g_pin_once, pin_init);
     if (!g_cpus) return;
-    uint64_t mask = role == 1 ? 1ull << 4 : role == 2 ? 1ull << 5 : role == 0 ? g_cpus & ~0x30ull : g_cpus;
+    uint64_t guest = pin_mask("SAVAGEWIND_PS4_PIN_GUEST", g_cpus & ~0x30ull);
+    uint64_t mask = role == 1 ? pin_mask("SAVAGEWIND_PS4_PIN_QUEUE", 1ull << 4)
+                    : role == 2 ? pin_mask("SAVAGEWIND_PS4_PIN_VKREC", 1ull << 5)
+                    : role == 3 ? pin_mask("SAVAGEWIND_PS4_PIN_MAIN", guest)
+                    : role == 0 ? guest : g_cpus;
+    static int logged[4];
+    if (role >= 0 && !__atomic_exchange_n(&logged[role], 1, __ATOMIC_RELAXED))
+        plat_log("[plat] pin role %d: cpus 0x%llx\n", role, (unsigned long long)mask);
     int r = scePthreadSetaffinity(scePthreadSelf(), mask);
     if (r) plat_log("[plat] scePthreadSetaffinity 0x%llx: 0x%x\n", (unsigned long long)mask, r);
 }

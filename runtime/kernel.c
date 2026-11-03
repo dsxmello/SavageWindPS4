@@ -534,13 +534,15 @@ void rt_unwind_point(void) {
     if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
 }
 
+static KThread *g_main_kthread;  // (the game's main thread: its own CPUs on the PS4, ps4_pin_thread role 3)
+
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
     crash_handler_install();
 #ifdef __ORBIS__
     { char nm[32]; snprintf(nm, sizeof nm, "guest h%x prio %d", t->handle, t->prio); ps4_profile_thread(nm); }
-    ps4_pin_thread(0);
+    ps4_pin_thread(t == g_main_kthread ? 3 : 0);
     ps4_guest_prio(t->prio);
 #endif
     rt_set_fpcr(0);
@@ -619,6 +621,7 @@ KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio
     region_add(stack, stack_size, 0xB, 3);
     KThread *t = thread_new(entry, 0, stack + stack_size, prio, 0);
     t->handle = kernel_new_handle(&t->obj);
+    g_main_kthread = t;
     return t;
 }
 
