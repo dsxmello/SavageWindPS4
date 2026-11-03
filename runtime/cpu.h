@@ -18,7 +18,8 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpsr;           // 328
     int32_t core_held;       // 336: KThread's core_held and prio (kernel.c), for the game code's dispatch (RT_CALL)
     int32_t prio;            // 340
-    uint8_t _pad[512 - 344];
+    struct Cpu *self;        // 344: itself; in a promoted function's copy (tools/promote.py), the Cpu it copies
+    uint8_t _pad[512 - 352];
     __uint128_t v[32];       // 512
 } Cpu;
 

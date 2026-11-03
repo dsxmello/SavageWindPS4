@@ -105,12 +105,12 @@ SN T FN(fix)(Cpu *c, int op, T a, T b, T d) {
     U x = FN(fb)(a), y = FN(fb)(b), z = FN(fb)(d);
     int nan = FN(isnan)(x) || FN(isnan)(y);
     switch (op) {
-    case FOP_SQRT: return FN(nan1)(c, a); // NaN in, or negative -> default NaN
+    case FOP_SQRT: return FN(nan1)(SIMD_REAL(c), a); // NaN in, or negative -> default NaN
     case FOP_MADD:
         if (FN(isnan)(x) || FN(isnan)(y) || FN(isnan)(z)) {
             if (FN(isqnan)(x) && ((FN(isinf)(y) && FN(iszero)(z)) || (FN(iszero)(y) && FN(isinf)(z))))
                 return FN(fv)(DNAN);
-            return FN(nan3)(c, a, b, d);
+            return FN(nan3)(SIMD_REAL(c), a, b, d);
         }
         return FN(fv)(DNAN);
     case FOP_MULX:
@@ -125,10 +125,10 @@ SN T FN(fix)(Cpu *c, int op, T a, T b, T d) {
             return FN(rsqrts)(a, b);
         }
         break;
-    case FOP_NMUL: return FN(neg)(FN(nan2)(c, a, b));
-    case FOP_ABD: return FN(fv)(FN(fb)(FN(nan2)(c, a, b)) & ~SGN);
+    case FOP_NMUL: return FN(neg)(FN(nan2)(SIMD_REAL(c), a, b));
+    case FOP_ABD: return FN(fv)(FN(fb)(FN(nan2)(SIMD_REAL(c), a, b)) & ~SGN);
     }
-    return FN(nan2)(c, a, b);
+    return FN(nan2)(SIMD_REAL(c), a, b);
 }
 
 // FMAX/FMIN/FMAXNM/FMINNM (operands already flushed)
@@ -139,7 +139,7 @@ SI T FN(minmax)(Cpu *c, int op, T a, T b) {
             if (FN(isqnan)(x) && !FN(isnan)(y)) return b;
             if (FN(isqnan)(y) && !FN(isnan)(x)) return a;
         }
-        return FN(nan2)(c, a, b);
+        return FN(nan2)(SIMD_REAL(c), a, b);
     }
     if (op == FOP_MAX || op == FOP_MAXNM) return a == b ? FN(fv)(x & y) : a > b ? a : b;
     return a == b ? FN(fv)(x | y) : a < b ? a : b;
@@ -159,7 +159,7 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
     volatile T va = a, vb = b, vd = d;
     volatile T vr = op == FOP_RSQRTS ? FN(rsqrts)(va, vb) : FCALC(op, va, vb, vd, K);
     T r = vr;
-    if (FBAD(op, r)) vr = FN(fix)(c, op, a, b, d), r = vr;
+    if (FBAD(op, r)) vr = FN(fix)(SIMD_REAL(c), op, a, b, d), r = vr;
     if ((fpcr & FPCR_FZ) && (FN(fb)(r) & ~SGN) <= MINN && !FN(iszero)(FN(fb)(r))) {
         if ((FN(fb)(r) & ~SGN) == MINN) {
             if (!set) old = simd_getround(), set = 1;
@@ -176,10 +176,10 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
 
 // Scalar FP op (constant op folds the selection).
 SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
-    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(slow)(c, op, a, b, d);
+    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(slow)(SIMD_REAL(c), op, a, b, d);
     if (FMINMAX(op)) return FN(minmax)(c, op, FN(fz)(c, a), FN(fz)(c, b));  // (picks an operand: flushed by hand)
     T r = FCALC(op, a, b, d, K);
-    if (__builtin_expect(FBAD(op, r), 0)) r = FN(fix)(c, op, a, b, d);
+    if (__builtin_expect(FBAD(op, r), 0)) r = FN(fix)(SIMD_REAL(c), op, a, b, d);
     return r;
 }
 
@@ -202,11 +202,11 @@ SI VT FN(vfz)(Cpu *c, VT a) {
 
 // Vector FP op: native lanes, any NaN (or an FPCR_SLOW setting) reruns all lanes through the scalar path.
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
-    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(vslow)(c, op, a, b, d);
+    if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(vslow)(SIMD_REAL(c), op, a, b, d);
     VT r;
     if (FMINMAX(op)) {
         a = FN(vfz)(c, a), b = FN(vfz)(c, b);  // (picks an operand: flushed by hand)
-        if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
+        if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0)) return FN(vslow)(SIMD_REAL(c), op, a, b, d);
         VTU x = (VTU)a, y = (VTU)b;
         if (op == FOP_MAX || op == FOP_MAXNM)
             r = (VT)FN(vsel)(a > b, x, FN(vsel)(a == b, x & y, y));
@@ -215,7 +215,7 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
         return r;
     }
     r = FCALC(op, a, b, d, VK);
-    if (__builtin_expect(__builtin_reduce_or(FBAD(op, r)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
+    if (__builtin_expect(__builtin_reduce_or(FBAD(op, r)) != 0, 0)) return FN(vslow)(SIMD_REAL(c), op, a, b, d);
     return r;
 }
 
@@ -250,7 +250,7 @@ SI T FN(frint)(Cpu *c, T x, int rm) {
     x = FN(fz)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
     T r = FN(rnd)(x, rm);
-    if (__builtin_expect(r != r, 0)) r = FN(nan1)(c, x);
+    if (__builtin_expect(r != r, 0)) r = FN(nan1)(SIMD_REAL(c), x);
     return r;
 }
 SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
@@ -266,7 +266,7 @@ SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
     }
     if (__builtin_expect(__builtin_reduce_or(r != r) != 0, 0))
         for (int i = 0; i < NL; i++)
-            if (r[i] != r[i]) r[i] = FN(nan1)(c, x[i]);
+            if (r[i] != r[i]) r[i] = FN(nan1)(SIMD_REAL(c), x[i]);
     return r;
 }
 
@@ -301,7 +301,7 @@ SN T FN(fromint_slow)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
     return x;
 }
 SI T FN(fromint)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
-    if (__builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(fromint_slow)(c, v, ib, uns, fbits);
+    if (__builtin_expect(c->fpcr & FPCR_RM, 0)) return FN(fromint_slow)(SIMD_REAL(c), v, ib, uns, fbits);
     T r;
     if (uns) r = ib == 32 ? (T)(uint32_t)v : (T)v;
     else r = ib == 32 ? (T)(int32_t)v : (T)(int64_t)v;
@@ -312,7 +312,7 @@ SI T FN(fromint)(Cpu *c, uint64_t v, int ib, int uns, int fbits) {
 // ---- reciprocal estimates (bit-exact ARMv8.0 pseudocode)
 SI T FN(recpe)(Cpu *c, T a) {
     U x = FN(fb)(FN(fz)(c, a)), s = x & SGN;
-    if (FN(isnan)(x)) return FN(nan1)(c, a);
+    if (FN(isnan)(x)) return FN(nan1)(SIMD_REAL(c), a);
     if (FN(isinf)(x)) return FN(fv)(s);
     if (FN(iszero)(x)) return FN(fv)(s | EXPM);
     U mag = x & ~SGN;
@@ -338,7 +338,7 @@ SI T FN(recpe)(Cpu *c, T a) {
 }
 SI T FN(rsqrte)(Cpu *c, T a) {
     U x = FN(fb)(FN(fz)(c, a)), s = x & SGN;
-    if (FN(isnan)(x)) return FN(nan1)(c, a);
+    if (FN(isnan)(x)) return FN(nan1)(SIMD_REAL(c), a);
     if (FN(iszero)(x)) return FN(fv)(s | EXPM);
     if (s) return FN(fv)(DNAN);
     if (FN(isinf)(x)) return K(0);
@@ -355,7 +355,7 @@ SI T FN(rsqrte)(Cpu *c, T a) {
 }
 SI T FN(recpx)(Cpu *c, T a) {
     U x = FN(fb)(FN(fz)(c, a)), s = x & SGN;
-    if (FN(isnan)(x)) return FN(nan1)(c, a);
+    if (FN(isnan)(x)) return FN(nan1)(SIMD_REAL(c), a);
     if (!(x & EXPM)) return FN(fv)(s | (EXPM - MINN));
     return FN(fv)(s | (~x & EXPM));
 }

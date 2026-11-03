@@ -15,7 +15,10 @@ the argument and callee-saved registers and returns those (ABI_IN, ABI_OUT), nev
 flags. Functions with code that touches *c by itself (tools/patches.py replacements, setjmp calls, inline asm, the
 all-instruction fallback) stay unpromoted: LI and OUT all registers.
 """
+import os
 import re
+
+import capstone
 
 SP, NZ = 31, 32
 ALL = (1 << 33) - 1
@@ -106,7 +109,8 @@ def declare(mask):
 
 class Fn:
     """One C function's instructions for the analysis (build)."""
-    __slots__ = ('entry', 'end', 'n', 'use', 'kill', 'succ', 'bnd', 'calls', 'tails', 'wr', 'ref', 'wrs', 'din')
+    __slots__ = ('entry', 'end', 'n', 'use', 'kill', 'succ', 'bnd', 'calls', 'tails', 'wr', 'ref', 'vref', 'vwr', 'wrs',
+                 'vwrs', 'din')
 
 
 def build(m, entry, end, tables):
@@ -121,7 +125,7 @@ def build(m, entry, end, tables):
     f.n = n
     f.use, f.kill, f.succ, f.bnd = [0] * n, [0] * n, [()] * n, [None] * n
     f.calls, f.tails = set(), set()
-    f.wrs = [0] * n  # (what each instruction writes: din below)
+    f.wrs, f.vwrs = [0] * n, [0] * n
     wr = ref = 0
     for i in range(n):
         a = entry + 4 * i
@@ -219,8 +223,81 @@ def build(m, entry, end, tables):
         else:
             return None
     f.wr, f.ref = wr, ref
+    f.vref, f.vwr = None, 0
     f.din = None
     return f
+
+
+# ---- the V registers (SIMD and FP) in a local copy of the Cpu (cv_: what the SIMD helpers and simd.h's VS32 etc.
+# take, SIMD_C), in compiled functions whose calls and tail calls all go to compiled functions: across those the
+# calling convention holds, so no analysis: a call or a tail call gets v0..v15 (arguments, and the callee-saved low
+# halves of v8..v15, which the callee saves from *c), a call's results come back in v0..v7, a return hands back
+# v0..v15. Which registers a function uses comes from the instructions (register lists included), not the C.
+V_IN = (1 << 16) - 1  # (a tail call or a return: arguments or results, and the callee-saved v8..v15)
+V_ARG = (1 << 8) - 1  # (a call: the callee saves and restores v8..v15 itself)
+V_RES = (1 << 8) - 1
+V_ALL = (1 << 32) - 1
+VMAX = int(os.environ.get('SW_PROMOTE_VMAX', '32'))
+NOT_SIMD = {'rt_dispatch', 'rt_udf', 'rt_svc', 'rt_setjmp_slot', 'hle_longjmp', 'ldx8', 'ldx16', 'ldx32', 'ldx64',
+            'stx8', 'stx16', 'stx32', 'stx64'}
+_VREG = re.compile(r'\b[vqdshb]([0-9]|[12][0-9]|3[01])\b')
+_CALL_C = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\(c([,)])')
+_cs = None
+
+
+def vregs(m, f):
+    """(used, written): the V registers f's instructions use and those they write (masks), or None when f can't
+    have them in locals."""
+    global _cs
+    if _cs is None:
+        _cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    mask = wmask = 0
+    for a in range(f.entry, f.end, 4):
+        w = m.word(a)
+        code = m.lift(a).code or ''
+        if 'fpcr' in code or 'fpsr' in code:  # (msr / mrs: the FPCR must stay in *c, where the game's code reads it)
+            return None
+        simd = (w >> 25 & 7) == 7 or ((w >> 25 & 1) == 0 and (w >> 27 & 1) == 1 and (w >> 26 & 1) == 1)
+        if not simd:
+            continue
+        for ins in _cs.disasm(w.to_bytes(4, 'little'), a):
+            if ' - ' in ins.op_str:  # (a register range: every one in it)
+                return None
+            # (every V register an instruction names counts as written by it: what capstone reports as written
+            # missed some, and a write that never got stored back lost the game's values)
+            for r in _VREG.findall(ins.op_str):
+                mask |= 1 << int(r)
+                wmask |= 1 << int(r)
+                f.vwrs[(a - f.entry) // 4] |= 1 << int(r)
+    if wmask & ~mask:
+        return None
+    return mask, wmask
+
+
+_VWR = re.compile(r'(?<![&\w])c->v\[(\d+)\] = ([^;]+);')
+_VRD = re.compile(r'(?<![&\w])c->v\[(\d+)\](?!\s*=[^=])')
+
+
+def vsubst(text):
+    """Promoted C (subst) reading and writing the V registers in cv_ (whole ones as vectors: simd.h VGET, VSETV)."""
+    text = _VWR.sub(lambda mm: f'VSETV(cv_, {mm.group(1)}, {mm.group(2)});', text)
+    text = _VRD.sub(lambda mm: f'VGET(cv_, {mm.group(1)})', text)
+    text = text.replace('c->v[', 'cv_->v[').replace('c->fpcr', 'cv_->fpcr')
+    return _CALL_C.sub(lambda mm: mm.group(0) if mm.group(1) in NOT_SIMD or mm.group(1).startswith('f_')
+                       else f'{mm.group(1)}(cv_{mm.group(2)}', text)
+
+
+def vdeclare(vmask):
+    return ('Cpu cvl_; Cpu *const cv_ = &cvl_; cvl_.fpcr = c->fpcr; cvl_.self = c; ' +
+            ''.join(f'VSETV(cv_, {i}, VGET(c, {i})); ' for i in range(32) if vmask >> i & 1)).rstrip()
+
+
+def vstore(vmask):
+    return ''.join(f'VSETV(c, {i}, VGET(cv_, {i})); ' for i in range(32) if vmask >> i & 1)
+
+
+def vload(vmask):
+    return ''.join(f'VSETV(cv_, {i}, VGET(c, {i})); ' for i in range(32) if vmask >> i & 1)
 
 
 def analyze(m, entries, hle, log):
@@ -344,21 +421,42 @@ def analyze(m, entries, hle, log):
             if want & ~OUT.get(t, 0):
                 OUT[t] = OUT.get(t, 0) | want
                 requeue(t)
-    # Which locals may differ from *c before each instruction (written since the entry or since a call reloaded them):
-    # only those get stored back before a call, a tail call or a return
+    nv = 0
+    # (debugging) SW_PROMOTE_VONLY=<lo>,<hi>: V registers in locals only for the candidates [lo, hi) of every 1000
+    vonly = os.environ.get('SW_PROMOTE_VONLY')
+    vlo, vhi = (int(x) for x in vonly.split(',')) if vonly else (0, 1000)
+    vcand = 0
+    vlist = set(os.environ['SW_PROMOTE_VLIST'].split(',')) if os.environ.get('SW_PROMOTE_VLIST') else None
+    for a, f in sorted(fns.items()):
+        if not os.environ.get('SW_PROMOTE_NO_V') and a in abi and all(t in abi or t in hle for t in f.calls | f.tails) and not any(
+                m.lift(x).kind == 'br' and not entries[a][2].get(x) for x in range(a, f.end, 4)):
+            vr = vregs(m, f)
+            f.vref, f.vwr = vr if vr and vr[0] else (None, 0)
+            if f.vref is not None and bin(f.vref).count('1') > VMAX:  # (more than the host's vector registers hold)
+                f.vref, f.vwr = None, 0
+            if f.vref is not None:
+                vcand += 1
+                if not vlo <= (vcand * 7919) % 1000 < vhi:
+                    f.vref, f.vwr = None, 0
+                elif vlist is not None and f'{a:x}' not in vlist:  # (SW_PROMOTE_VLIST=<hex>,...: only these)
+                    f.vref, f.vwr = None, 0
+            nv += f.vref is not None
+    # Which locals may differ from *c before each instruction (written since the entry or the last reload): only
+    # those get stored back (registers are bits 0..32, V registers 33..64)
     for a, f in fns.items():
+        vr = f.vref or 0
         din = [None] * f.n
         if f.n:
             din[0] = 0
         work2 = [0] if f.n else []
         while work2:
             i = work2.pop()
-            d = din[i] | f.wrs[i]
+            d = din[i] | f.wrs[i] | (f.vwrs[i] & vr) << 33
             b = f.bnd[i]
             if b is not None and b[0] == 'call':
-                d &= ~(OUT.get(b[1], ALL) & f.ref)
+                d &= ~((OUT.get(b[1], ALL) & f.ref) | (V_RES & vr) << 33)
             elif b is not None and b[0] == 'ucall':
-                d &= ~(b[2] & f.ref)
+                d &= ~((b[2] & f.ref) | ((V_RES & vr) << 33 if b[1] != SVC_IN else 0))
             for t in f.succ[i]:
                 if din[t] is None or d & ~din[t]:
                     din[t] = d if din[t] is None else din[t] | d
@@ -368,5 +466,5 @@ def analyze(m, entries, hle, log):
     m.promo_leftover = [a for a in fns if a in abi and LI[a] & SCRATCH]  # (compiled functions reading leftovers)
     n_out = sum(1 for a in fns if OUT[a] & SCRATCH)
     log(f'promote: {len(fns)} of {len(entries)} functions promoted ({len(abi)} compiled functions), {rounds} '
-        f'analyses; temporaries or flags in: {n_li}, out: {n_out}')
+        f'analyses; temporaries or flags in: {n_li}, out: {n_out}; {nv} with V registers')
     return fns, {a: li_of(a) for a in LI}, OUT

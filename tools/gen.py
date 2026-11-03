@@ -422,11 +422,14 @@ class Module:
         # split every instruction into its own block and made LLVM's register coalescer take minutes per function.
         refs = set()
         p = self.promo and entry in self.promo[0]
+        # (V registers in cv_: simd.h's VS32 etc. read them there, back to c after it)
+        vin = ['#undef SIMD_C', '#define SIMD_C cv_'] if p and self.promo[0][entry].vref is not None else []
+        vout = ['#undef SIMD_C', '#define SIMD_C c'] if vin else []
         if not tables or 'all' in tables.values():
-            out = self._emit_body(entry, end, labels, tables, refs, 'plain', p)
+            out = vin + self._emit_body(entry, end, labels, tables, refs, 'plain', p) + vout
         else:
             out = [f'static void {fname(entry)}_r(Cpu *c);']
-            out += self._emit_body(entry, end, labels, tables, refs, 'fast', p)
+            out += vin + self._emit_body(entry, end, labels, tables, refs, 'fast', p) + vout
             out += self._emit_body(entry, end, labels, tables, refs, 'resume')
         self._refs = refs
         return out
@@ -438,27 +441,34 @@ class Module:
         if promoted:
             fns, LI, OUT = self.promo
             f = fns[entry]
-            sub = promote.subst
+            vr = f.vref or 0
+            if f.vref is not None:
+                def sub(t):
+                    return promote.vsubst(promote.subst(t))
+            else:
+                sub = promote.subst
 
             # Before a call, a tail call or a return: the locals in mask that may differ from *c there (dirty[0]:
-            # tools/promote.py's din, for the instruction being emitted). After a call (ld): those that came back.
+            # tools/promote.py's din, for the instruction being emitted), and the V registers the convention hands
+            # over (vmask). After a call (ld): those that came back.
             dirty = [0]
 
-            def st(mask):
-                return promote.store(mask & f.wr & dirty[0])
+            def st(mask, vmask=promote.V_IN):
+                d = dirty[0]
+                return promote.store(mask & f.wr & d) + promote.vstore(vmask & f.vwr & (d >> 33))
 
-            def ld(mask):  # (after a statement: with its separating space)
-                return (' ' + promote.load(mask & f.ref)).rstrip()
+            def ld(mask, vmask=promote.V_RES):  # (after a statement: with its separating space)
+                return (' ' + promote.load(mask & f.ref) + promote.vload(vmask & vr)).rstrip()
         else:
             def sub(t):
                 return t
 
             dirty = [0]
 
-            def st(mask):
+            def st(mask, vmask=0):
                 return ''
 
-            def ld(mask):
+            def ld(mask, vmask=0):
                 return ''
             LI = OUT = {}
         ALL = promote.ALL
@@ -471,6 +481,8 @@ class Module:
             out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
             if promoted and f.ref:
                 out.append('    ' + promote.declare(f.ref))
+            if promoted and f.vref is not None:
+                out.append('    ' + promote.vdeclare(f.vref))
         batch = []
 
         def flush():
@@ -490,7 +502,7 @@ class Module:
         if all_labels:
             labels = set(range(entry, end, 4))
         def miss():  # (at the table's br: what is dirty there)
-            return (f'{st(ALL)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
+            return (f'{st(ALL, promote.V_ALL)}__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast'
                     else 'goto L_dispatch;')
         last = None
         here = [entry]
@@ -523,9 +535,9 @@ class Module:
             flush()
             if k == 'op' or k == 'trap':
                 if 'rt_udf(' in ins.code:
-                    out.append('    ' + st(ALL) + ins.code)
+                    out.append('    ' + st(ALL, promote.V_ALL) + ins.code)
                 elif 'rt_svc(' in ins.code:
-                    out.append('    ' + st(promote.SVC_IN) + sub(ins.code) + ld(promote.SVC_OUT))
+                    out.append('    ' + st(promote.SVC_IN, 0) + sub(ins.code) + ld(promote.SVC_OUT, 0))
                 else:
                     out.append('    ' + sub(ins.code))
             elif k == 'b':
@@ -541,14 +553,15 @@ class Module:
                 elif self.in_text(t):
                     refs.add(t)
                     dirty[0] |= promote.X30
-                    out.append(f'    {lr} {st(LI.get(t, ALL))}{fname(t)}(c);{ld(OUT.get(t, ALL))}')
+                    out.append(f'    {lr} {st(LI.get(t, ALL), promote.V_ARG)}{fname(t)}(c);{ld(OUT.get(t, ALL))}')
                 else:
                     dirty[0] |= promote.X30
-                    out.append(f'    {lr} c->pc = {hx(t)}; {st(promote.ABI_IN)}RT_CALL(c);{ld(promote.ABI_OUT)}')
+                    out.append(f'    {lr} c->pc = {hx(t)}; {st(promote.ABI_IN, promote.V_ARG)}RT_CALL(c);'
+                               f'{ld(promote.ABI_OUT)}')
             elif k == 'blr':
                 dirty[0] |= promote.X30
                 out.append(f'    c->pc = {sub(ins.target)}; {sub(f"c->x[30] = {hx(a + 4)};")} '
-                           f'{st(promote.ABI_IN)}RT_CALL(c);{ld(promote.ABI_OUT)}')
+                           f'{st(promote.ABI_IN, promote.V_ARG)}RT_CALL(c);{ld(promote.ABI_OUT)}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -567,9 +580,9 @@ class Module:
         flush()
         if promoted and end > entry:
             i = (end - entry) // 4 - 1
-            dirty[0] = f.din[i] | f.wrs[i]
+            dirty[0] = f.din[i] | f.wrs[i] | (f.vwrs[i] & (f.vref or 0)) << 33
         if last not in ('b', 'br', 'ret', 'trap'):
-            out.append('    ' + jump(end) if end < self.hi else f'    {st(ALL)}rt_udf(c, {hx(end)});')
+            out.append('    ' + jump(end) if end < self.hi else f'    {st(ALL, promote.V_ALL)}rt_udf(c, {hx(end)});')
         if all_labels:
             out.append('L_dispatch: RT_LOOP_BARRIER;')
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))

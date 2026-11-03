@@ -572,6 +572,7 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     tls_next += 0x200;
     t->cpu.tpidrro = t->tlr;
     t->cpu.thread = t;
+    t->cpu.self = &t->cpu;  // (cpu.h)
     klock();
     t->anext = g_threads;
     g_threads = t;
