@@ -626,6 +626,25 @@ static uint64_t full_hash_budget, full_hash_budget_frame;
 
 // Four independent lanes (one serial multiply chain ran at ~1.5 bytes/cycle; dynamic textures are hashed every
 // frame). Values are only compared within a run.
+#ifdef __SSE4_2__
+// With SSE4.2 (the PS4's Jaguar), four lanes of the crc32 instruction instead: the Jaguar's 64-bit multiply is slow, and
+// the open world hashes ~70 MB a second (linear targets before their passes and after copies back, dynamic textures;
+// "hash MB" in the [vk] line). Four 32-bit CRCs fold into the 64-bit value: still only compared within a run.
+#include <nmmintrin.h>
+static uint64_t hash_full(const uint8_t *p, uint64_t n) {
+    uint64_t a = n, b = 0x9E3779B9u, c = 0xC2B2AE3Du, d = 0x165667B1u, i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t v[4];
+        memcpy(v, p + i, 32);
+        a = _mm_crc32_u64(a, v[0]);
+        b = _mm_crc32_u64(b, v[1]);
+        c = _mm_crc32_u64(c, v[2]);
+        d = _mm_crc32_u64(d, v[3]);
+    }
+    for (; i < n; i++) a = _mm_crc32_u8((uint32_t)a, p[i]);
+    return (a | b << 32) ^ ((c | d << 32) * 0x9E3779B97F4A7C15ull);
+}
+#else
 static uint64_t hash_full(const uint8_t *p, uint64_t n) {
     uint64_t h0 = 0x9E3779B97F4A7C15ull ^ n, h1 = 0xC2B2AE3D27D4EB4Full, h2 = 0x165667B19E3779F9ull, h3 = 0x27D4EB2F165667C5ull;
     uint64_t i = 0;
@@ -641,6 +660,7 @@ static uint64_t hash_full(const uint8_t *p, uint64_t n) {
     for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
     return h ^ (h >> 31);
 }
+#endif
 
 // 8 bytes at each of up to 512 places (a byte at each of 4096 was a cache miss per byte: ~50 textures a frame are
 // sampled in the open world; 2048 places were still ~2.5% of the PS4's queue thread). A texture the game streams
