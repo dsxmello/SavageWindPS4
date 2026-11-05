@@ -9,7 +9,8 @@ the PS4 build swaps in four things:
 
 It builds on the PS4 Vulkan stack of DolphinPS4 and dusklight-ps4, as TriAevum PS4 set it up and ran it on the console.
 
-**Status:** the eboot builds and packages. Nothing has run on a console yet. A package without the game code runs a
+**Status:** it runs on the console: the Shrine of Resurrection and the open world play with sound, saving and loading
+(base PS4: ~43 fps in the shrine, ~28 in the open world, 21-23 in Kakariko). A package without the game code runs a
 console test instead of the game (see "First test").
 
 ## What it needs
@@ -104,7 +105,7 @@ Your game files go there too, sent by FTP (GoldHEN's FTP server, port 2121):
   - The game code is built for the Jaguar (`-march=btver2`: AVX, no AVX2 / FMA) from the portable C SIMD mode.
   - FMADD and the like go through `runtime/simd_softfma.h` (the PC's compatible target uses it too): exact, but slow.
   - On a PC, `make GENARCH=-march=btver2 B=build/btver2` builds that variant to test it.
-- **Host stacks:** 16 MB per guest thread instead of 256 MB, from direct memory (`plat_alloc_stack`): plain pthread
+- **Host stacks:** 2 MB per guest thread instead of 256 MB, from direct memory (`plat_alloc_stack`): plain pthread
   stacks come from the process's small flexible memory, which ran out at the game's 6th thread. `SAVAGEWIND_HOST_STACK_MB` sets it on the PC, to find what
   the game needs.
 - **Paths:** the kernel refuses relative paths, so `ps4/ps4_paths.c` wraps the path calls (`--wrap`).
