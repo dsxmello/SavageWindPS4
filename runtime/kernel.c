@@ -206,7 +206,7 @@ static void core_acquire(KThread *t) {
     core_best_update(k);
     uint64_t w0 = (k->owner || !core_next(k, t)) ? plat_now_ns() : 0;
     bool behind_worse = k->owner && k->owner->prio > t->prio;
-    while ((k->owner || !core_next(k, t)) && !g_rt_unwind) pthread_cond_wait(&k->cv, &k->m);
+    while ((k->owner || !core_next(k, t)) && !g_rt_unwind) plat_cond_wait_ms(&k->cv, &k->m, 1);
     if (w0) {
         uint64_t w = plat_now_ns() - w0;
         __atomic_fetch_add(&t->core_wait_ns, w, __ATOMIC_RELAXED);
@@ -320,7 +320,7 @@ static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
     if (held) core_release(t);  // (lock order: g_klock, then a core's m; core_acquire never runs under g_klock)
     bool r;
     if (timeout_ns < 0) {
-        pthread_cond_wait(cv, &g_klock);
+        plat_cond_wait_ms(cv, &g_klock, 10);  // (10 ms: ~47 guest threads, most idle; the callers loop on their wait)
         r = true;
     } else {
         r = pthread_cond_timedwait(cv, &g_klock, ts) == 0;
@@ -443,6 +443,7 @@ void kernel_log_core_waits(void) {
     // [blocks]: the threads that spent over 5% of the time blocked
     char bl[4096];
     int m = snprintf(bl, sizeof bl, "[blocks] waits by length (<20us <50us <200us <1ms longer; spun; %% of the time):");
+    const int m0 = m;  // (no thread listed: SAVAGEWIND_WAIT_STATS off, no line)
     // [waitfor]: for those, the threads that ended their waits (kind m mutex, c condvar, a arbiter; "-": none, a
     // timeout; "+": the rest) with the time, the count and, for mutexes, the owner's time waiting for its core
     static char wf[64][640];
@@ -492,7 +493,7 @@ void kernel_log_core_waits(void) {
     }
     pthread_mutex_unlock(&g_klock);
     LOG("%s\n", line);
-    LOG("%s\n", bl);
+    if (m > m0) LOG("%s\n", bl);
     LOG("%s\n", kl);
     for (int i = 0; i < nwf; i++) LOG("%s\n", wf[i]);
 }
@@ -779,8 +780,12 @@ static uint32_t block_current(int64_t timeout_ns) {
     extern bool nvn_timeline(void);
     uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
-    uint64_t blk_t0 = plat_now_ns();
-    KObject *own = kind == WAIT_MUTEX ? handle_get(mutex_owner(t->wait_addr)) : NULL;
+    // ("[blocks]" / "[waitfor]" measuring, SAVAGEWIND_WAIT_STATS=1: two clock reads and a table walk per wait, thousands
+    // a second, so off unless asked for)
+    static int ws = -1;
+    if (ws < 0) ws = getenv("SAVAGEWIND_WAIT_STATS") && atoi(getenv("SAVAGEWIND_WAIT_STATS")) > 0;
+    uint64_t blk_t0 = ws ? plat_now_ns() : 0;
+    KObject *own = ws && kind == WAIT_MUTEX ? handle_get(mutex_owner(t->wait_addr)) : NULL;
     KThread *owner = own && own->type == KOBJ_THREAD ? (KThread *)own : NULL;
     uint64_t owner_cw0 = owner ? __atomic_load_n(&owner->core_wait_all, __ATOMIC_RELAXED) : 0;
     t->woken_by = 0;
@@ -814,7 +819,7 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
-    {
+    if (ws) {
         uint64_t d = plat_now_ns() - blk_t0;
         t->blk_hist[d < 20000 ? 0 : d < 50000 ? 1 : d < 200000 ? 2 : d < 1000000 ? 3 : 4]++;
         t->blk_ns += d;

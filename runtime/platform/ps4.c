@@ -255,12 +255,45 @@ void ps4_guest_prio(int prio) {
 }
 
 #define HOST_THREAD_STACK (2ull << 20)
-typedef struct { void *(*fn)(void *); void *arg; } HostStart;
+// Stacks of host threads that returned, for the next host thread of the same size: FFmpeg starts 4 decoder threads per
+// video (hle/movie.c), and without reuse every video kept 8 MB of direct memory for good (sw-play-066: 154 MB of
+// stacks after 16 min). shortcut: a stack is handed out again only 1 s after its thread returned (the thread still
+// runs its exit on it), assumes no thread takes that long to exit; a thread ending in pthread_exit keeps its stack.
+#define FREE_STACKS 32
+static struct { void *p; size_t size; uint64_t at; } g_free_stacks[FREE_STACKS];
+static int g_nfree_stacks;
+static pthread_mutex_t g_free_stacks_m = PTHREAD_MUTEX_INITIALIZER;
+static void stack_release(void *p, size_t size, uint64_t at) {
+    pthread_mutex_lock(&g_free_stacks_m);
+    if (g_nfree_stacks < FREE_STACKS) {
+        g_free_stacks[g_nfree_stacks].p = p;
+        g_free_stacks[g_nfree_stacks].size = size;
+        g_free_stacks[g_nfree_stacks++].at = at;
+    }
+    pthread_mutex_unlock(&g_free_stacks_m);
+}
+static void *stack_reuse(size_t size) {
+    void *p = NULL;
+    uint64_t now = plat_now_ns();
+    pthread_mutex_lock(&g_free_stacks_m);
+    for (int i = 0; i < g_nfree_stacks; i++)
+        if (g_free_stacks[i].size == size && now - g_free_stacks[i].at >= 1000000000ull) {
+            p = g_free_stacks[i].p;
+            g_free_stacks[i] = g_free_stacks[--g_nfree_stacks];
+            break;
+        }
+    pthread_mutex_unlock(&g_free_stacks_m);
+    return p;
+}
+
+typedef struct { void *(*fn)(void *); void *arg; void *stack; size_t size; } HostStart;
 static void *host_thread_start(void *a) {
     HostStart s = *(HostStart *)a;
     free(a);
     ps4_pin_thread(-1);
-    return s.fn(s.arg);
+    void *r = s.fn(s.arg);
+    if (s.stack) stack_release(s.stack, s.size, plat_now_ns());
+    return r;
 }
 int __real_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg);
 int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(void *), void *arg) {
@@ -274,22 +307,26 @@ int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr, void *(*fn)(
         pthread_attr_getdetachstate(attr, &detach);
     }
     pthread_once(&g_pin_once, pin_init);
-    HostStart *hs = g_cpus ? malloc(sizeof *hs) : NULL;
-    if (hs) hs->fn = fn, hs->arg = arg, fn = host_thread_start, arg = hs;
-    void *stack = alloc_stack(size, "thread");
+    size = (size + CHUNK - 1) & ~(CHUNK - 1);
+    void *stack = stack_reuse(size);
+    if (!stack) stack = alloc_stack(size, "thread");
+    HostStart *hs = g_cpus || stack ? malloc(sizeof *hs) : NULL;
+    if (hs) *hs = (HostStart){fn, arg, stack, size}, fn = host_thread_start, arg = hs;
     if (!stack) {
         int r = __real_pthread_create(t, attr, fn, arg);
         if (r && hs) free(hs);
         return r;
     }
-    size = (size + CHUNK - 1) & ~(CHUNK - 1);
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, detach);
     pthread_attr_setstack(&a, stack, size);
     int r = __real_pthread_create(t, &a, fn, arg);
     pthread_attr_destroy(&a);
-    if (r && hs) free(hs);
+    if (r) {
+        if (hs) free(hs);
+        stack_release(stack, size, 0);  // (never used: free at once)
+    }
     return r;
 }
 
@@ -458,9 +495,10 @@ static int sampling(void) {
     if (on < 0) on = getenv("SAVAGEWIND_PS4_SAMPLE") && atoi(getenv("SAVAGEWIND_PS4_SAMPLE")) > 0;
     return on;
 }
+void ps4_heap_private_arena(const char *name);  // (ps4/ps4_runtime.cpp: a malloc arena of its own, off the shared lock)
 void ps4_profile_thread(const char *name) {
-    if (!strcmp(name, "queue")) ps4_pin_thread(1);  // (see ps4_pin_thread; guest threads: kernel.c thread_main)
-    else if (!strcmp(name, "vkrec")) ps4_pin_thread(2);
+    if (!strcmp(name, "queue")) ps4_pin_thread(1), ps4_heap_private_arena(name);  // (see ps4_pin_thread; guest threads: kernel.c thread_main)
+    else if (!strcmp(name, "vkrec")) ps4_pin_thread(2), ps4_heap_private_arena(name);
     if (!sampling()) return;
     ps4_sampler_start();  // (once)
     ps4_sampler_register_thread(strdup(name));  // (kept: the sampler holds the pointer)

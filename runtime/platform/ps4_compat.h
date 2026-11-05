@@ -1,7 +1,21 @@
 // What the PS4's libc (OpenOrbis musl) lacks (included via runtime/platform.h on the PS4 only).
 #pragma once
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
+
+// pthread_cond_wait that also returns after ms: on the PS4 a wake-up can get lost while a signal (the sampler's SIGPROF
+// every ms, SAVAGEWIND_PS4_SAMPLE=1) interrupts the wait - TriAevum PS4 recovered ~20 a second that way. Every caller
+// waits in a loop that rechecks its condition, as pthread_cond_wait's spurious wake-ups require anyway.
+static inline void plat_cond_wait_ms(pthread_cond_t *cv, pthread_mutex_t *m, int ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += ms * 1000000L;
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    pthread_cond_timedwait(cv, m, &ts);
+}
 
 // Guest RNG requests (svcGetInfo random entropy) and nothing security-related: the TSC mixed by splitmix64.
 static inline uint32_t arc4random(void) {

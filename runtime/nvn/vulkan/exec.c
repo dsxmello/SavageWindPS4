@@ -3349,11 +3349,14 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     // (PS4: the heap gets memory on first touch; a GPU read of a chunk without any faults the GPU.) The chunks found
     // backed are remembered, one byte each: plat_commit ~4 times a draw was ~2% of the queue thread (a 16-entry cache
     // of them thrashed: the buffers are all over the heap). Chunks stay backed until a reboot (vk_exec_reset).
+    // (every chunk of the range, not only its ends: a buffer over 3+ chunks can have both ends backed and not the middle)
     uint64_t c0 = (addr - HEAP_BASE) >> 21, c1 = (addr + size - 1 - HEAP_BASE) >> 21;
-    if (!gd_backed[c0] || !gd_backed[c1]) {
-        plat_commit(addr, size);
-        for (uint64_t c = c0; c <= c1; c++) gd_backed[c] = 1;
-    }
+    for (uint64_t c = c0; c <= c1; c++)
+        if (!gd_backed[c]) {
+            plat_commit(addr, size);
+            for (c = c0; c <= c1; c++) gd_backed[c] = 1;
+            break;
+        }
 #endif
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;

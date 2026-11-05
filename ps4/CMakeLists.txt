@@ -128,6 +128,8 @@ list(APPEND PS4_RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/ps4_sampler.cpp)
 # and its heap (ps4_heap_usage for platform/ps4.c's memory lines; logStack kept inside the stack)
 list(FILTER PS4_RUNTIME_SOURCES EXCLUDE REGEX "ps4_runtime\\.cpp$")
 list(APPEND PS4_RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/ps4_runtime.cpp)
+# (the heap's control-block check on every malloc/free writes globals all threads share: only to hunt a corruption)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ps4_runtime.cpp PROPERTIES COMPILE_DEFINITIONS PS4_HEAP_CHECKS=0)
 
 add_executable(savagewind
     ${RT_SRC} ${UI_SRC} ${IMGUI_SRC}

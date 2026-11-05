@@ -591,12 +591,10 @@ void* __wrap_memalign(size_t alignment, size_t size) {
     return p;
 }
 
-// Gives the calling thread a private arena if it is one of Dolphin's busy threads (called when
-// a thread names itself: Common::SetCurrentThreadName -> ps4_watch_thread).
+// Gives the calling thread a private arena if it is one of Savage Wind's busy host threads (platform/ps4.c
+// ps4_profile_thread: the NVN -> Vulkan translation and its recording thread).
 void ps4_heap_private_arena(const char* name) {
-    static const char* const busy[] = {"CPU thread", "CPU-GPU thread", "Video thread",
-                                       "VK submission thread", "AsyncShaderCompiler Worker",
-                                       "DVD thread", "Audio thread - PS4"};
+    static const char* const busy[] = {"queue", "vkrec"};
     if (t_arena || !name || !getHeap())
         return;
     bool wanted = false;

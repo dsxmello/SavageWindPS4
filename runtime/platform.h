@@ -12,6 +12,9 @@
 #elif defined(__linux__)
 #include "platform/linux_compat.h"
 #endif
+#ifndef __ORBIS__
+#define plat_cond_wait_ms(cv, m, ms) pthread_cond_wait(cv, m)  // (the PS4's: platform/ps4_compat.h)
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -245,7 +245,7 @@ static void *queue_thread(void *arg) {
     kernel_sample_host_thread();
     pthread_mutex_lock(&g_q_lock);
     for (;;) {
-        while (g_q_done == g_q_put) pthread_cond_wait(&g_q_work, &g_q_lock);
+        while (g_q_done == g_q_put) plat_cond_wait_ms(&g_q_work, &g_q_lock, 1);
         QOp o = g_q[g_q_done % QCAP];
         pthread_mutex_unlock(&g_q_lock);
         if (o.op == QOP_EXEC) TL("queue: exec %llx", (unsigned long long)o.a);
@@ -265,7 +265,7 @@ static void queue_block(bool (*done)(uint64_t), uint64_t arg) {
         pthread_mutex_unlock(&g_q_lock);
         kernel_host_work_begin();
         pthread_mutex_lock(&g_q_lock);
-        while (!done(arg)) pthread_cond_wait(&g_q_progress, &g_q_lock);
+        while (!done(arg)) plat_cond_wait_ms(&g_q_progress, &g_q_lock, 1);
         pthread_mutex_unlock(&g_q_lock);
         kernel_host_work_end();  // (taking the core back without the queue's lock: its holder may be queueing)
         pthread_mutex_lock(&g_q_lock);

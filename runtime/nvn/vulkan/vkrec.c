@@ -87,7 +87,7 @@ void vr_sync(void) {
     }
     pthread_mutex_lock(&r_lock);
     atomic_store(&r_waiting, true);
-    while (atomic_load(&r_tail) != h) pthread_cond_wait(&r_done, &r_lock);
+    while (atomic_load(&r_tail) != h) plat_cond_wait_ms(&r_done, &r_lock, 1);
     atomic_store(&r_waiting, false);
     pthread_mutex_unlock(&r_lock);
 }
@@ -97,7 +97,7 @@ static void wait_room(uint64_t need) {  // until the consumer is no more than RI
         wake();
         pthread_mutex_lock(&r_lock);
         atomic_store(&r_waiting, true);
-        if (put_at + need - atomic_load(&r_tail) > RING) pthread_cond_wait(&r_done, &r_lock);
+        if (put_at + need - atomic_load(&r_tail) > RING) plat_cond_wait_ms(&r_done, &r_lock, 1);
         atomic_store(&r_waiting, false);
         pthread_mutex_unlock(&r_lock);
     }
@@ -646,7 +646,7 @@ static void *rec_thread(void *arg) {
                 pthread_mutex_lock(&r_lock);
                 atomic_store_explicit(&r_slept_at, t, memory_order_relaxed);
                 atomic_store(&r_sleeping, true);
-                while ((h = atomic_load(&r_head)) == t) pthread_cond_wait(&r_work, &r_lock);
+                while ((h = atomic_load(&r_head)) == t) plat_cond_wait_ms(&r_work, &r_lock, 1);
                 atomic_store(&r_sleeping, false);
                 pthread_mutex_unlock(&r_lock);
             }
