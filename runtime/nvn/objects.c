@@ -1036,8 +1036,12 @@ static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, 
     return d;
 }
 
+// Texture pool changes (initialized, a texture registered): the backend's memo of draws without feedback
+// (vulkan/exec.c resolve_feedback) holds only while this stays the same
+uint64_t g_tex_regs;
 NVN(nvnTexturePoolInitialize) {
     desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnTexEntry), g_texture_pools);
+    __atomic_add_fetch(&g_tex_regs, 1, __ATOMIC_RELEASE);
     RET(1);
 }
 NVN(nvnTexturePoolFinalize) { (void)c; }
@@ -1053,6 +1057,7 @@ static void register_texture(Cpu *c) {
     e->tex = HOST(NvnTexture, A(2));
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    __atomic_add_fetch(&g_tex_regs, 1, __ATOMIC_RELEASE);
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }

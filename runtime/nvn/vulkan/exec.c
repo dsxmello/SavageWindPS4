@@ -523,6 +523,9 @@ static void uub_note(uint64_t lo, uint64_t hi) {
 // 25.0 -> 25.9 fps, memcpy 10% -> 3% of the queue thread. The PC's Iris Xe, short of GPU time, lost 7% to the ~10000
 // GPU copies a second (49.2 -> 45.9 fps standing still): off there. SAVAGEWIND_VK_GCOPY_DELTA=0 / 1: off / on.
 static uint64_t stat_gcopy_delta, stat_gcopy_delta_bytes;
+// Bytes of guest memory hashed (the "hash" field): linear targets before a pass (linear_target_sync), after a copy back
+// lands (readbacks), and textures' full hashes (textures.c upload_texture)
+static uint64_t stat_hash_sync, stat_hash_rb;
 static bool guest_copy_delta(__typeof__(gcopy[0]) *e, uint64_t addr, uint64_t size, VkSpan *out) {
     static int on = -1;
     if (on < 0) {
@@ -833,6 +836,12 @@ const char *renderer_stats(void) {
                  (unsigned long long)stat_uub, (unsigned long long)stat_uub_same, (unsigned long long)stat_gcopy_hit,
                  (unsigned long long)stat_gcopy_miss, stat_gcopy_bytes / 1048576.0, (unsigned long long)stat_gcopy_delta,
                  stat_gcopy_delta_bytes / 1048576.0);
+        extern uint64_t prof_tex_full_bytes;
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, ", hash MB: linear %.1f readback %.1f textures %.1f", stat_hash_sync / 1048576.0,
+                 stat_hash_rb / 1048576.0, prof_tex_full_bytes / 1048576.0);
+        stat_hash_sync = stat_hash_rb = 0;
+        if (!prof) prof_tex_full_bytes = 0;  // (VK_PROF: its own line reads and clears it)
         n = strlen(stats_text);
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
         stat_build_waits = 0;
@@ -988,6 +997,7 @@ static void linear_target_sync(NvnTexture *t) {
     bool reload = false;
     if (i >= 0 && !linear_mem[i].pending) {  // (a copy back still in flight: the memory is the GPU's until it lands)
         uint64_t h = vk_hash_bytes((const void *)(uintptr_t)t->addr, size);
+        stat_hash_sync += size;
         reload = i >= n || h != linear_mem[i].hash || serial != linear_mem[i].serial;  // (first use: whatever the CPU put there)
         linear_mem[i].hash = h;
         linear_mem[i].serial = serial;
@@ -1100,6 +1110,7 @@ static void readbacks_apply(void) {
             if (m >= 0) {
                 if (linear_mem[m].pending > 0) linear_mem[m].pending--;
                 linear_mem[m].hash = vk_hash_bytes((const void *)(uintptr_t)r->addr, r->stride * r->rows);
+                stat_hash_rb += r->stride * r->rows;
                 linear_mem[m].serial = r->serial;
             }
         }
@@ -2835,11 +2846,22 @@ static void resolve_feedback(Prog *pr) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_FEEDBACK") != NULL;
     if (off) return;
+    // The last time this ran, no texture the draw samples was a target, and what decides that hasn't changed since (the
+    // program, the texture handles bound, the pool and what is registered in it, the targets): none is now either. Looking
+    // each texture up in the pool for every draw was ~2% of the PS4's queue thread.
+    extern uint64_t g_tex_regs;  // (objects.c)
+    static struct { Prog *pr; NvnDescPool *tpool; uint64_t regs; RtState rt; uint64_t tex[2][32]; } clean;
+    uint64_t regs = __atomic_load_n(&g_tex_regs, __ATOMIC_ACQUIRE);
+    if (clean.pr == pr && clean.tpool == st.tpool && clean.regs == regs && !memcmp(clean.tex, st.tex, sizeof clean.tex) &&
+        !memcmp(&clean.rt, &st.rt, sizeof st.rt))
+        return;
+    bool any = false;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < infos[sg]->ntex; i++) {
             NvnTexture *t = shader_texture_object(sg, &infos[sg]->tex[i]);
             if (!is_attachment(t)) continue;
+            any = true;
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
@@ -3031,6 +3053,11 @@ static void resolve_feedback(Prog *pr) {
             snap_ok[si] = true;
             st.rt_dirty = true;
         }
+    if (any) clean.pr = NULL;
+    else {
+        clean.pr = pr, clean.tpool = st.tpool, clean.regs = regs, clean.rt = st.rt;
+        memcpy(clean.tex, st.tex, sizeof clean.tex);
+    }
 }
 
 // ================================================================== resource binding
@@ -3339,10 +3366,10 @@ static VkDescriptorBufferInfo gmem_info(void) {
 // g_guest_buffer): no per-draw copy, no index scan for the copy size. The game fences its CPU writes as on the
 // Switch. Falls back to copies outside the heap or without the import; SAVAGEWIND_VK_COPY_VERTICES=1 forces copies.
 static uint8_t gd_backed[HEAP_MAX >> 21];  // (PS4) the 2 MiB heap chunks known backed
-static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
-    static int copy = -1;
-    if (copy < 0) copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
-    if (copy || addr < HEAP_BASE) return false;
+static int gd_copy = -1;  // SAVAGEWIND_VK_COPY_VERTICES
+static __attribute__((noinline)) bool guest_direct_slow(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (gd_copy < 0) gd_copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
+    if (gd_copy || addr < HEAP_BASE) return false;
     if (!gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
 #ifdef __ORBIS__
@@ -3361,6 +3388,22 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;
+}
+// ~6 calls a draw (indices, vertex streams, constant buffers): the usual case inline - in the imported heap and, on the
+// PS4, inside one chunk already known backed (the call itself was ~4% of the PS4's queue thread). The rest, and the
+// first call (gd_copy still unknown), go the slow way.
+static inline bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    uint64_t rel = addr - HEAP_BASE;  // (below the heap: huge, fails the first test)
+    if (__builtin_expect(rel < gmem_size && size && size <= gmem_size - rel && !gd_copy, 1)
+#ifdef __ORBIS__
+        && (rel >> 21) == ((rel + size - 1) >> 21) && gd_backed[rel >> 21]
+#endif
+    ) {
+        *buf = gmem_buf;
+        *off = rel;
+        return true;
+    }
+    return guest_direct_slow(addr, size, buf, off);
 }
 
 // ---- shaders that store to global memory, and the CPU's copies of guest memory
@@ -4507,8 +4550,8 @@ static void draw_(CmdRec *r, bool indexed) {
             last_fs = fs;
             // (by code address, like the program table: 512 bytes hashed byte by byte at every fragment shader change
             // cost 1% of the translation)
-            static struct { uint64_t fs, hash; } memo[512];
-            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 55);  // (code addresses are 256-aligned)
+            static struct { uint64_t fs, hash; } memo[4096];  // (512 collided: hmix still ~0.2% of the PS4's queue thread)
+            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 52);  // (code addresses are 256-aligned)
             if (fs && memo[ms].fs == fs) last_hash = memo[ms].hash;
             else {
                 last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
