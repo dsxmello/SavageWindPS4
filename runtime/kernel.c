@@ -167,10 +167,24 @@ volatile int g_core_best_wait[CORE_TOKENS];  // (INT_MAX set by cores_on)
 // function entry too, 0.54, changed nothing: the shrine's h120 still waited behind worse threads 10% of its time.)
 // (k->m held)
 volatile unsigned char g_core_preempt[5];
+// With a token per core and priority (SAVAGEWIND_CORES=2) a better thread can still wait for a token: one whose
+// priority a mutex it holds raised (prio_refresh) waits in its own priority's queue, ahead of the others there but
+// behind the holder until that one blocks. Its waiter - BOTW's main thread in Hateno, 7-11% of its time - waited that
+// long too ("starved" in [waitfor]). So the game code's flag is per core: set while any token of that core has a
+// better waiter than its holder, and the holders of that core check their own token at their next indirect call
+// (kernel_preempt).
+static uint8_t g_tok_need[CORE_TOKENS];
+static int g_core_need[4];
 static void core_flag_update(Core *k) {
     int i = (int)(k - g_cores);
-    if (i >= 4) return;  // (a token per priority: a better thread has a token of its own, never waits for this one)
-    __atomic_store_n(&g_core_preempt[i + 1], k->owner && g_core_best_wait[i] < k->owner->prio, __ATOMIC_RELAXED);
+    uint8_t need = k->owner && g_core_best_wait[i] < k->owner->prio;
+    if (g_cores_on != 2) {
+        __atomic_store_n(&g_core_preempt[i + 1], need, __ATOMIC_RELAXED);
+        return;
+    }
+    if (__atomic_exchange_n(&g_tok_need[i], need, __ATOMIC_RELAXED) == need) return;
+    int c = i / 64, n = __atomic_add_fetch(&g_core_need[c], need ? 1 : -1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_core_preempt[c + 1], n > 0, __ATOMIC_RELAXED);
 }
 static void core_best_update(Core *k) {  // (k->m held)
     static int off = -1;
@@ -238,7 +252,7 @@ static void core_acquire(KThread *t) {
     core_best_update(k);
     if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
     t->core_held = k->owner == t ? idx : -1;
-    t->cpu.core_held = idx < 4 ? t->core_held : -1;  // (cpu.h g_core_preempt: per core only)
+    t->cpu.core_held = t->core_held < 0 ? -1 : g_cores_on == 2 ? idx / 64 : idx;  // (cpu.h g_core_preempt: per core)
     core_flag_update(k);
     pthread_mutex_unlock(&k->m);
 }
@@ -1455,7 +1469,10 @@ void kernel_reset(void) {
     for (int i = 0; i < CORE_TOKENS; i++) {
         g_cores[i].owner = NULL;
         g_cores[i].nwaiting = 0;
+        g_tok_need[i] = 0;
     }
+    memset(g_core_need, 0, sizeof g_core_need);
+    memset((void *)g_core_preempt, 0, sizeof g_core_preempt);
     g_rt_unwind = 0;
     pthread_mutex_unlock(&g_klock);
 }
