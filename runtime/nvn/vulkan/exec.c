@@ -840,6 +840,11 @@ const char *renderer_stats(void) {
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", hash MB: linear %.1f readback %.1f textures %.1f", stat_hash_sync / 1048576.0,
                  stat_hash_rb / 1048576.0, prof_tex_full_bytes / 1048576.0);
+        extern uint64_t g_astc_ns, g_astc_texels, g_fs_read_ns, g_fs_read_bytes;  // (textures.c, services/fs.c)
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, ", astc %.1f ms (%.1f Mtexels), reads %.1f ms (%.1f MB)",
+                 __atomic_exchange_n(&g_astc_ns, 0, __ATOMIC_RELAXED) / 1e6, __atomic_exchange_n(&g_astc_texels, 0, __ATOMIC_RELAXED) / 1e6,
+                 __atomic_exchange_n(&g_fs_read_ns, 0, __ATOMIC_RELAXED) / 1e6, __atomic_exchange_n(&g_fs_read_bytes, 0, __ATOMIC_RELAXED) / 1048576.0);
         stat_hash_sync = stat_hash_rb = 0;
         if (!prof) prof_tex_full_bytes = 0;  // (VK_PROF: its own line reads and clears it)
         n = strlen(stats_text);

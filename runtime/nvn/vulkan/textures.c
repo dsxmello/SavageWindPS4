@@ -802,6 +802,8 @@ static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferI
     vk_defer_image(img, mem);
 }
 
+// (measuring) time and texels of the ASTC decodes (on the CPU: the PS4's GPU has no ASTC): the "[vk]" line's "astc"
+uint64_t g_astc_ns, g_astc_texels;
 // Guest memory -> image for the levels in level_mask (bit per level), every layer or slice.
 static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
     const FormatInfo *fi = t->layout.fmt;
@@ -819,6 +821,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             if (!((level_mask >> lv) & 1)) continue;
             LevelLayout l = tegra_level(&t->layout, lv);
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
+                uint64_t t0 = plat_now_ns();
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
@@ -826,6 +829,8 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
                 free(blocks);
+                __atomic_add_fetch(&g_astc_ns, plat_now_ns() - t0, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&g_astc_texels, (uint64_t)l.w * l.h, __ATOMIC_RELAXED);
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};

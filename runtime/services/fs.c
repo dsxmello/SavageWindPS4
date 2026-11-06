@@ -496,8 +496,18 @@ void fs_title_version_patch(void) {
     memcpy(fmt, "%s", 3);
 }
 
-// Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
+// (measuring) time and bytes the game's reads took (RomFS and files): the "[vk]" line's "romfs" field
+uint64_t g_fs_read_ns, g_fs_read_bytes;
+static ssize_t romfs_read_(int fd, uint8_t *dst, uint64_t size, uint64_t off);
 static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
+    uint64_t t0 = plat_now_ns();
+    ssize_t r = romfs_read_(fd, dst, size, off);
+    __atomic_add_fetch(&g_fs_read_ns, plat_now_ns() - t0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_fs_read_bytes, size, __ATOMIC_RELAXED);
+    return r;
+}
+// Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
+static ssize_t romfs_read_(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
     plat_commit((uint64_t)(uintptr_t)dst, size);  // (the kernel writes there: backed first where that is lazy, PS4)
     if (!ov_n && !npatches) return pread(fd, dst, size, (off_t)off);
     uint64_t done = 0;
@@ -636,7 +646,10 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
             n = off >= 0 && (uint64_t)off < f->patched_size ? (ssize_t)((uint64_t)size < f->patched_size - (uint64_t)off ? (uint64_t)size : f->patched_size - (uint64_t)off) : 0;
             memcpy((void *)(uintptr_t)b->addr, f->patched + off, (size_t)n);
         } else {
+            uint64_t t0 = plat_now_ns();
             n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
+            __atomic_add_fetch(&g_fs_read_ns, plat_now_ns() - t0, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_fs_read_bytes, (uint64_t)size, __ATOMIC_RELAXED);
         }
         if (strstr(f->path, "savedata")) {
             LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);
