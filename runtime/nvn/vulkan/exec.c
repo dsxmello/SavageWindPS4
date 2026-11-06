@@ -1253,9 +1253,17 @@ static void begin_pass(void) {
     // translated (~13 ms in the open world) and only then rendered it, and the game waits for the GPU to finish a frame
     // (nvnSyncWait) before it goes on: the two times added up, a fifth of the frames ran over 31.7 ms, and the game
     // went to 20 fps. A submission at a pass boundary every ~300 draws lets the GPU work on the frame meanwhile.
-    // SAVAGEWIND_VK_SUBMIT_DRAWS=<n> sets the count (0: one submission per command list, as before).
+    // SAVAGEWIND_VK_SUBMIT_DRAWS=<n> sets the count (0: one submission per command list, as before). The PS4 submits
+    // every ~100: its GPU finished a frame ~7 ms after the translation, and the game waited for that (open world, same
+    // session: 300 draws 27.76 fps with the main thread waiting 4.3 ms a frame, 100 28.28 / 3.1 ms, 50 28.0 / 2.1 ms -
+    // the extra submissions cost the translation more than the shorter wait gave).
+#ifdef __ORBIS__
+    const int submit_def = 100;
+#else
+    const int submit_def = 300;
+#endif
     static int submit_draws = -1;
-    if (submit_draws < 0) submit_draws = getenv("SAVAGEWIND_VK_SUBMIT_DRAWS") ? atoi(getenv("SAVAGEWIND_VK_SUBMIT_DRAWS")) : 300;
+    if (submit_draws < 0) submit_draws = getenv("SAVAGEWIND_VK_SUBMIT_DRAWS") ? atoi(getenv("SAVAGEWIND_VK_SUBMIT_DRAWS")) : submit_def;
     // Not once the list has recorded a shader that stores to guest memory (global memory, the imported heap): run
     // on the GPU while the rest of the list is translated, it wrote memory this thread was copying for later draws and
     // dispatches (uniforms, vertices), they got half-written data, and the GPU faulted on a write (~1 world load in
