@@ -40,6 +40,7 @@ struct KThread {
     KThread *anext;        // every thread of this boot (g_klock)
     // core scheduling (runtime/kernel.c "cores"): the core it runs on, the one it holds (-1: none) and its turn
     int core_held;
+    int core_tok;  // the core token it last waited for or held (kernel.c core_acquire: a core, or a core and priority)
     uint64_t core_ticket;
     bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
     uint64_t core_wait_ns;  // (measuring) time spent waiting for its core's token (kernel_log_core_waits)
@@ -100,7 +101,7 @@ void kernel_host_work_end(void);
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max);
 void kernel_sample_host_thread(void);  // (profiling) the calling host thread is sampled too (handle 0xf000 + n)
 // A better thread waits for t's core: t lets it have it (dispatch.c, at indirect calls; g_core_best_wait: per core)
-extern volatile int g_core_best_wait[4];
+extern volatile int g_core_best_wait[4 * 64];  // (kernel.c CORE_TOKENS)
 void kernel_preempt(KThread *t);
 // (debug) every guest thread and core to the log: what each waits in. Lock-free reads: for a hang, not exact.
 void kernel_dump_threads(const char *why);

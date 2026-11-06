@@ -138,6 +138,11 @@ static pthread_cond_t g_nothread_cond = PTHREAD_COND_INITIALIZER;
 // number, then first come); a thread that sees a better one waiting for its core at a syscall gives it up.
 // Generated code has no preemption points of its own, so a long stretch without syscalls keeps the core.
 // SAVAGEWIND_CORES=0 lets every thread run at once, as before.
+// SAVAGEWIND_CORES=2 (the PS4's default; =1 the per-core tokens): a token per core and priority instead. Only threads of one core and one priority take turns as
+// on the console; a better thread may run beside a worse one of its core. On Horizon a better thread preempts a worse
+// one anywhere (woken from another core, a timer), so a game can't rely on excluding it without a lock; equal
+// priorities never interleave but at a block or yield, which this keeps. (CORES=0 was +5.8% in the PS4 open world:
+// prio-48 job threads waited 50-90% of their time for their core behind prio-44 workers.)
 #ifdef __ORBIS__
 void ps4_profile_thread(const char *name);  // (platform/ps4.c: SAVAGEWIND_PS4_SAMPLE)
 void ps4_pin_thread(int role);  // (platform/ps4.c) the calling thread's CPUs: 0 a guest thread, -1 a host thread
@@ -151,16 +156,12 @@ typedef struct {
     int nwaiting;
     uint64_t next_ticket;
 } Core;
-static Core g_cores[4] = {
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
-};
-static int g_cores_on = -1;
+#define CORE_TOKENS (4 * 64)  // (by core, or by core * 64 + priority with SAVAGEWIND_CORES=2)
+static Core g_cores[CORE_TOKENS];
+static int g_cores_on = -1;  // 0 off, 1 a token per core, 2 per core and priority
 // The best (lowest) priority among the threads waiting for each core, INT_MAX with none: what dispatch.c checks at every
 // indirect call (kernel_preempt). SAVAGEWIND_NO_PREEMPT=1: kept at INT_MAX (preemption at syscalls only, as before).
-volatile int g_core_best_wait[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+volatile int g_core_best_wait[CORE_TOKENS];  // (INT_MAX set by cores_on)
 // The same as a yes or no for the game code's inline dispatch (cpu.h RT_DC_HIT: one load), indexed by the holder's
 // core + 1 (0: holding none, never set): a thread better than the core's holder waits for it. (A check at every
 // function entry too, 0.54, changed nothing: the shrine's h120 still waited behind worse threads 10% of its time.)
@@ -168,6 +169,7 @@ volatile int g_core_best_wait[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
 volatile unsigned char g_core_preempt[5];
 static void core_flag_update(Core *k) {
     int i = (int)(k - g_cores);
+    if (i >= 4) return;  // (a token per priority: a better thread has a token of its own, never waits for this one)
     __atomic_store_n(&g_core_preempt[i + 1], k->owner && g_core_best_wait[i] < k->owner->prio, __ATOMIC_RELAXED);
 }
 static void core_best_update(Core *k) {  // (k->m held)
@@ -180,8 +182,23 @@ static void core_best_update(Core *k) {  // (k->m held)
     core_flag_update(k);
 }
 
+static pthread_once_t g_cores_once = PTHREAD_ONCE_INIT;
+static void cores_init(void) {
+    const char *e = getenv("SAVAGEWIND_CORES");
+#ifdef __ORBIS__
+    int def = 2;  // (open world, PS4: 27.9 fps against 23.7 with a token per core, 28.2 with none)
+#else
+    int def = 1;
+#endif
+    g_cores_on = e && !strcmp(e, "0") ? 0 : e && !strcmp(e, "1") ? 1 : e && !strcmp(e, "2") ? 2 : def;
+    for (int i = 0; i < CORE_TOKENS; i++) {
+        pthread_mutex_init(&g_cores[i].m, NULL);
+        pthread_cond_init(&g_cores[i].cv, NULL);
+        g_core_best_wait[i] = INT_MAX;
+    }
+}
 static bool cores_on(void) {
-    if (g_cores_on < 0) g_cores_on = !(getenv("SAVAGEWIND_CORES") && !strcmp(getenv("SAVAGEWIND_CORES"), "0"));
+    pthread_once(&g_cores_once, cores_init);
     return g_cores_on;
 }
 
@@ -199,7 +216,9 @@ static void core_acquire(KThread *t) {
     static int one_core = -1;  // (debug) SAVAGEWIND_ONE_CORE=1: every thread on core 0, one guest thread at a time
     if (one_core < 0) one_core = getenv("SAVAGEWIND_ONE_CORE") != NULL;
     int idx = one_core ? 0 : t->core & 3;
+    if (g_cores_on == 2) idx = idx * 64 + (t->base_prio < 0 ? 0 : t->base_prio > 63 ? 63 : t->base_prio);
     Core *k = &g_cores[idx];
+    t->core_tok = idx;
     pthread_mutex_lock(&k->m);
     t->core_ticket = k->next_ticket++;
     if (k->nwaiting < 64) k->waiting[k->nwaiting++] = t;
@@ -218,7 +237,8 @@ static void core_acquire(KThread *t) {
         if (k->waiting[i] == t) { k->waiting[i] = k->waiting[--k->nwaiting]; break; }
     core_best_update(k);
     if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
-    t->core_held = t->cpu.core_held = k->owner == t ? idx : -1;
+    t->core_held = k->owner == t ? idx : -1;
+    t->cpu.core_held = idx < 4 ? t->core_held : -1;  // (cpu.h g_core_preempt: per core only)
     core_flag_update(k);
     pthread_mutex_unlock(&k->m);
 }
@@ -512,8 +532,9 @@ void kernel_dump_threads(const char *why) {
             kinds[t->wait_kind & 3], (unsigned long long)t->wait_addr, t->in_sync_wait ? " (sync)" : "",
             (unsigned long long)t->cpu.pc, (unsigned long long)t->cpu.x[30], (unsigned long long)t->cpu.sp);
     }
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CORE_TOKENS; i++) {
         Core *k = &g_cores[i];
+        if (i >= 4 && !k->owner && !k->nwaiting) continue;
         LOG("[hang]   core %d: owner t%lld, %d waiting:", i, k->owner ? (long long)k->owner->id : -1LL, k->nwaiting);
         for (int j = 0; j < k->nwaiting && j < 64; j++)
             LOG(" t%llu(p%d)", (unsigned long long)k->waiting[j]->id, k->waiting[j]->prio);
@@ -673,7 +694,7 @@ static void prio_set(KThread *t, int p) {
     if (t == t_cur) ps4_guest_prio(p);  // (another thread's, raised while it holds a mutex: its host priority stays)
 #endif
     if (!cores_on() || t->off_cores) return;
-    Core *k = &g_cores[t->core & 3];  // (waiting for its core or holding it: the waiters' order and the best wait change)
+    Core *k = &g_cores[t->core_tok];  // (waiting for its token or holding it: the waiters' order and the best wait change)
     pthread_mutex_lock(&k->m);
     core_best_update(k);
     pthread_cond_broadcast(&k->cv);
@@ -1388,7 +1409,8 @@ void kernel_stop_threads(void (*idle)(void)) {
             if (t->started && !t->finished) { live++; wake(t); }
         pthread_cond_broadcast(&g_nothread_cond);
         pthread_mutex_unlock(&g_klock);
-        for (int i = 0; i < 4; i++) {  // threads waiting for a core run on to their next safe point
+        cores_on();  // (the tokens initialized)
+        for (int i = 0; i < CORE_TOKENS; i++) {  // threads waiting for a core run on to their next safe point
             pthread_mutex_lock(&g_cores[i].m);
             pthread_cond_broadcast(&g_cores[i].cv);
             pthread_mutex_unlock(&g_cores[i].m);
@@ -1430,7 +1452,7 @@ void kernel_reset(void) {
     heap_size = 0;
     tls_next = TLS_BASE;
     next_thread_id = 0x50;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CORE_TOKENS; i++) {
         g_cores[i].owner = NULL;
         g_cores[i].nwaiting = 0;
     }
