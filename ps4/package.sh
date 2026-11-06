@@ -9,6 +9,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/env.sh"
 VERSION="${1:-00.01}"
 build="$SW_PS4_BUILD/build/savagewind${PGO:+-pgo-$PGO}"  # (PGO=generate|use: build.sh's PGO trees)
+[ "${PGO:-}" = use ] && : "${THINLTO:=1}"
+[ "${THINLTO:-0}" = 1 ] && build="$build-lto"  # (THINLTO=1, the default with PGO=use: build.sh's ThinLTO tree)
 eboot="$build/savagewind_eboot/eboot.bin"
 [ -f "$eboot" ] || { echo "no eboot: ps4/build.sh first" >&2; exit 1; }
 

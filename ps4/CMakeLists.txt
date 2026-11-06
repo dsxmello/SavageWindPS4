@@ -189,4 +189,19 @@ target_link_options(savagewind PRIVATE
     "LINKER:--wrap=access,--wrap=truncate,--wrap=chdir,--wrap=getcwd,--wrap=realpath"
     # Host threads' stacks in direct memory, not the small flexible memory (platform/ps4.c __wrap_pthread_create).
     "LINKER:--wrap=pthread_create")
+# SW_THINLTO (ps4/build.sh THINLTO=1): the runtime and the game code are compiled to LLVM bitcode and optimized across
+# files when linked (ThinLTO, with the PGO profile when there is one), by the host's lld: OpenOrbis' is older than clang
+# and can't read it. The link's DT_FLAGS then get what the console needs (elf_static_tls.py) before create-fself.
+option(SW_THINLTO "ThinLTO with the host's lld" OFF)
+if (SW_THINLTO)
+    target_compile_options(savagewind PRIVATE -flto=thin)
+    if (TARGET swgame)
+        target_compile_options(swgame PRIVATE -flto=thin)
+    endif ()
+    set(SW_THINLTO_JOBS 4 CACHE STRING "ThinLTO backend jobs (memory: ~1-2 GB each)")
+    target_link_options(savagewind PRIVATE -z now --thinlto-jobs=${SW_THINLTO_JOBS} -plugin-opt=mcpu=btver2 --lto-O2
+        --thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache)
+    add_custom_command(TARGET savagewind POST_BUILD
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/elf_static_tls.py $<TARGET_FILE:savagewind> VERBATIM)
+endif ()
 ps4_add_eboot(savagewind)

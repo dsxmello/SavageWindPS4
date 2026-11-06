@@ -27,6 +27,13 @@ case "$PGO" in
     *) echo "PGO must be generate, use or empty" >&2; exit 1 ;;
 esac
 pgo_args+=(-DSW_GEN_OPT="${SW_GEN_OPT:--O2 -fno-vectorize -fno-slp-vectorize}")
+# THINLTO=1: ThinLTO linked by the host's lld (ps4/CMakeLists.txt SW_THINLTO), in a tree of its own. The default with
+# PGO=use (open-world bench, same session: 31.46 fps with the host's lld alone, 33.37 with ThinLTO); THINLTO=0: off.
+[ "$PGO" = use ] && : "${THINLTO:=1}"
+if [ "${THINLTO:-0}" = 1 ]; then
+    build="$build-lto"
+    pgo_args+=(-DSW_THINLTO=ON -DCMAKE_LINKER="$PS4_VK_ROOT/tools/host-bin/ld.lld-21")
+fi
 [ "${1:-}" = clean ] && rm -rf "$build"
 if [ ! -f "$build/CMakeCache.txt" ]; then
     env -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS -u LIBS \
