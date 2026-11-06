@@ -1,5 +1,6 @@
---- a/src/amd/common/ac_ps4_drm.c
-+++ b/src/amd/common/ac_ps4_drm.c
+diff -ruN a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+--- a/src/amd/common/ac_ps4_drm.c	2026-11-06 00:05:43.818928980 -0300
++++ b/src/amd/common/ac_ps4_drm.c	2026-11-06 00:05:51.182603969 -0300
 @@ -107,6 +107,7 @@
     bool tail_mapped;   /* the overflow tail is mapped after the buffer (see PS4_TAIL) */
     bool tail_reported;
@@ -130,8 +131,24 @@
        if (b && b->tail_mapped && addr == b->last_va) {
           ps4_check_tail(dev, b, "unmapped");
           b->tail_mapped = false;
---- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
-+++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -2071,6 +2114,14 @@
+ static void
+ ps4_note_submit(uint64_t dwords, unsigned links, int64_t ns)
+ {
++   /* Only with SAVAGEWIND_GNM_STATS set: each report went through sceKernelDebugOutText on this
++    * thread, and the frame after one ran ~15-30 ms late (29 of 33 reports in Savage Wind's open
++    * world). */
++   static int on = -1;
++   if (on < 0)
++      on = getenv("SAVAGEWIND_GNM_STATS") != NULL;
++   if (!on)
++      return;
+    const int big = dwords >= 4096;
+    ps4_submit_stats.count[big]++;
+    ps4_submit_stats.dwords[big] += dwords;
+diff -ruN a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c	2026-11-06 00:05:43.819640414 -0300
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c	2026-11-06 00:05:43.821463436 -0300
 @@ -917,11 +917,19 @@
      */
     vm_alignment = radv_amdgpu_get_optimal_vm_alignment(ws, size, ws->info.gart_page_size);
