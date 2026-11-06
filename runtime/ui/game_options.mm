@@ -140,7 +140,7 @@ const char *const k_shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", 
 const char *const k_icons[] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Nintendo"};  // (ICONS_*)
 constexpr int k_fps[] = FPS_CHOICES;  // frame rate (0: Off, no limit)
 const char *const k_vsync[VSYNC_COUNT] = {"On", "Fast", "Adaptive", "Off"};  // (settings.h VSYNC_*)
-constexpr int FPS_DEFAULT_INDEX = 2;
+constexpr int FPS_DEFAULT_INDEX = FPS_DEFAULT == 30 ? 1 : 2;  // (settings.h: 30 on the PS4)
 static_assert(k_fps[FPS_DEFAULT_INDEX] == FPS_DEFAULT);
 constexpr int k_sens[] = {10, 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800, 1000};  // mouse sensitivity, %
 constexpr int SENS_DEFAULT = 9;  // (300%: MOUSE_SENS_DEFAULT)
