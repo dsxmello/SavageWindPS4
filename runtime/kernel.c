@@ -116,6 +116,11 @@ static KCond g_nothread_cond = KCOND_INIT;
 // number, then first come); a thread that sees a better one waiting for its core at a syscall gives it up.
 // Generated code has no preemption points of its own, so a long stretch without syscalls keeps the core.
 // SAVAGEWIND_CORES=0 lets every thread run at once, as before.
+#ifdef __ORBIS__
+void ps4_profile_thread(const char *name);  // (platform/ps4.c: SAVAGEWIND_PS4_SAMPLE)
+void ps4_pin_thread(int role);  // (platform/ps4.c) the calling thread's CPUs: 0 a guest thread, -1 a host thread
+void ps4_guest_prio(int prio);  // (platform/ps4.c) the calling guest thread's host priority from its own
+#endif
 typedef struct {
     KMutex m;
     KCond cv;
@@ -197,6 +202,9 @@ void kernel_thread_off_cores(void) {
     if (!t) return;
     core_release(t);
     t->off_cores = true;
+#ifdef __ORBIS__
+    ps4_pin_thread(-1);  // (not on the guest threads' CPUs)
+#endif
 }
 
 // Host code running on a guest thread (an HLE call) waits until t without holding the thread's core, in slices of
@@ -312,7 +320,11 @@ int kernel_data_regions(uint64_t *addr, uint64_t *size, int max) {
 
 static void region_add_impl(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm, bool commit) {
     if (nregions == 1024) FATAL("too many regions\n");
-    if (commit) plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the region)
+#ifdef __ORBIS__
+    (void)commit;  // (physical memory for every page mapped: backed on first touch instead, file reads commit their own)
+#else
+    if (commit) plat_commit(addr, size);
+#endif  // back it before the OS writes there (Windows: file reads into the region)
     int i = nregions++;
     while (i > 0 && regions[i - 1].addr > addr) { regions[i] = regions[i - 1]; i--; }
     regions[i] = (Region){addr, size, type, perm};
@@ -373,6 +385,9 @@ volatile int g_rt_unwind;
 static pthread_t g_host_threads[4];  // (profiling) host threads the sampler takes too: handles 0xf000 + i
 static int g_nhost_threads;
 void kernel_sample_host_thread(void) {
+#ifdef __ORBIS__
+    ps4_profile_thread("queue");
+#endif
     klock();
     if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
     kunlock();
@@ -391,6 +406,7 @@ void rt_unwind_point(void) {
     if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
 }
 
+static KThread *g_main_kthread;  // (the game's main thread: its own CPUs on the PS4, ps4_pin_thread role 3)
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
@@ -400,6 +416,11 @@ static void *thread_main(void *arg) {
         prof_thread_name(pn);
     }
     crash_handler_install();
+#ifdef __ORBIS__
+    { char nm[32]; snprintf(nm, sizeof nm, "guest h%x prio %d", t->handle, t->prio); ps4_profile_thread(nm); }
+    ps4_pin_thread(t == g_main_kthread ? 3 : 0);
+    ps4_guest_prio(t->prio);
+#endif
     rt_set_fpcr(0);
     core_acquire(t);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
@@ -473,7 +494,16 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
 static void thread_start(KThread *t) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-#ifndef _WIN32
+#ifdef __ORBIS__
+    // (a plain pthread stack comes from the process's small flexible memory - the game's 6th thread found none left and
+    // never ran; plat_alloc_stack takes it from direct memory. 2 MB: BOTW starts ~47 threads, the deepest used ~20 KB,
+    // an overflow faults on the guard below the stack. SAVAGEWIND_HOST_STACK_MB sets it.)
+    size_t stack_sz = (getenv("SAVAGEWIND_HOST_STACK_MB") && atoi(getenv("SAVAGEWIND_HOST_STACK_MB")) > 0
+                           ? (size_t)atoi(getenv("SAVAGEWIND_HOST_STACK_MB")) : 2) << 20;
+    void *stack = plat_alloc_stack(stack_sz);
+    if (!stack) FATAL("no memory for the host stack of thread %llu (%zu MB)\n", (unsigned long long)t->id, stack_sz >> 20);
+    pthread_attr_setstack(&attr, stack, stack_sz);
+#elif !defined(_WIN32)
     pthread_attr_setstacksize(&attr, 256ull << 20);  // guest recursion runs on the host stack
 #else
     // (the same 256 MB, as the program's default stack reservation: Makefile, --stack. winpthreads hands a stack size to
@@ -481,7 +511,8 @@ static void thread_start(KThread *t) {
     // process's commit charge, which a PC must cover with RAM + page file. Reserved, a stack commits as it grows.)
 #endif
     t->started = true;
-    pthread_create(&t->host, &attr, thread_main, t);
+    int pr = pthread_create(&t->host, &attr, thread_main, t);
+    if (pr) FATAL("cannot start the host thread of guest thread %llu (error %d)\n", (unsigned long long)t->id, pr);
     pthread_attr_destroy(&attr);
 }
 
@@ -490,6 +521,7 @@ KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio
     region_add(stack, stack_size, 0xB, 3);
     KThread *t = thread_new(entry, 0, stack + stack_size, prio, 0);
     t->handle = kernel_new_handle(&t->obj);
+    g_main_kthread = t;
     return t;
 }
 
@@ -536,6 +568,9 @@ static bool prio_inherit_on(void) {
 static void prio_set(KThread *t, int p) {
     if (t->prio == p) return;
     t->prio = p;
+#ifdef __ORBIS__
+    if (t == t_cur) ps4_guest_prio(p);  // (another thread's, raised while it holds a mutex: its host priority stays)
+#endif
     if (!cores_on() || t->off_cores) return;
     Core *k = &g_cores[t->core & 3];  // (waiting for its core or holding it: the waiters' order and the best wait change)
     kmutex_lock(&k->m);

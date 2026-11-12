@@ -164,7 +164,7 @@ void kcond_broadcast(KCond *c) { cond_wake(c, true); }
 static bool cond_wait(KCond *c, KMutex *m, const struct timespec *abs) {
     if (!mode()) {
         if (!abs) {
-            pthread_cond_wait(&c->pc, &m->pm);
+            plat_cond_wait_ms(&c->pc, &m->pm, 10);  // (PS4: a wake-up can get lost, platform/ps4_compat.h; callers loop)
             return true;
         }
         return pthread_cond_timedwait(&c->pc, &m->pm, abs) == 0;

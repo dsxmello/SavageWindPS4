@@ -73,8 +73,13 @@ static void rtld_fini_main(Cpu *c) {
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
+static bool g_guest_reserve_failed;  // (PS4: reported once the log is open; no re-exec there)
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
     if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+#ifdef __ORBIS__
+    g_guest_reserve_failed = true;
+    return;
+#endif
     const char *tries = getenv("SAVAGEWIND_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
@@ -120,7 +125,7 @@ void reboot_test_frame(uint64_t frame) {
 #ifdef __APPLE__
 extern const ResetFn __start_resets[] __asm__("section$start$__DATA$__rt_reset");
 extern const ResetFn __stop_resets[] __asm__("section$end$__DATA$__rt_reset");
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__ORBIS__)  // (ELF)
 extern const ResetFn __start_resets[], __stop_resets[];  // (ELF: defined by the linker)
 #else
 // PE/COFF: .rst$a < .rst$m (entries, hle.h) < .rst$z (the linker sorts by the text after '$')
@@ -344,6 +349,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--update-health")) return POST_UPDATE_HEALTH_EXIT;
     if (post_update_recover_if_cut()) return 0;  // (a new copy of this program is running now, with its files put back)
     plat_init();
+    if (g_guest_reserve_failed)
+        FATAL("guest address range %llx-%llx could not be reserved\n", (unsigned long long)GUEST_LO, (unsigned long long)GUEST_HI);
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
 #else
@@ -375,6 +382,9 @@ int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (launcher_config_key_held()) config = true;  // (the Mac's "Savage Wind Configuration": Option held)
 #endif
+#ifdef __ORBIS__
+    skip_launcher = true;  // (no start screen: the game files and code are set up on the PC, docs/ps4.md)
+#endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     // (after it: savagewind.ini is in the data root; before it the file wasn't found where that isn't where we started)
     settings_load();
@@ -383,6 +393,9 @@ int main(int argc, char **argv) {
     if (sparse_heap < 0 || sparse_heap >= SPARSE_HEAP_COUNT) sparse_heap = SPARSE_HEAP_AUTO;
     LOG("[settings] sparse_heap=%s\n", sparse_heap_modes[sparse_heap]);
     if (dump) return dump_romfs(root, dump);
+#ifdef SW_PS4_NO_GAME
+    if (!gamelib_present(root)) { extern void ps4_no_game_test(void); ps4_no_game_test(); }  // (ps4/no_game.c)
+#endif
     if (scan) return scan_shaders(root);
     if (add_steam) {  // what Configuration's Add to Steam does, from a terminal (runtime/steam_shortcuts.h)
         char msg[800];
@@ -447,6 +460,11 @@ int main(int argc, char **argv) {
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
         sc_lock_drop(save_lock);
+#ifdef __ORBIS__
+        (void)kind;
+        mode = LAUNCHER_NONE;
+#else
         mode = kind == RT_REBOOT_TITLE ? LAUNCHER_CONFIG : LAUNCHER_NONE;
+#endif
     }
 }

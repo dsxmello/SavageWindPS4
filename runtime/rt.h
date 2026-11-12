@@ -22,8 +22,17 @@ static inline void rt_log(const char *fmt, ...) {
     if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;  // (cut off, never longer than one line in practice)
     fwrite(buf, 1, (size_t)n, stderr);
 }
+#ifdef __ORBIS__
+// (PS4) Each message formatted on the caller's stack and written in one write(2): the threads come from
+// scePthreadCreate (platform/ps4.c __wrap_pthread_create), so the C library never takes stderr's lock, and many
+// threads logging at once (SAVAGEWIND_TIMELINE) corrupted its FILE (crashes in the callers).
+void plat_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#define LOG(...) plat_log(__VA_ARGS__)
+#define FATAL(...) (plat_log("FATAL: " __VA_ARGS__), rt_fatal_trace())
+#else
 #define LOG(...) rt_log(__VA_ARGS__)
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
+#endif
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the

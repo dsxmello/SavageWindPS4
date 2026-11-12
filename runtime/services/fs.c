@@ -1394,6 +1394,9 @@ void fs_title_version_patch(void) {
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
 static ssize_t romfs_read(RomImage *m, uint8_t *dst, uint64_t size, uint64_t off) {
+#ifdef __ORBIS__
+    plat_commit((uint64_t)(uintptr_t)dst, size);  // (the kernel writes there: backed first, PS4)
+#endif
     if (!m->ov_n && !m->npatches) return romfs_image_pread(m->img, dst, size, off);
     uint64_t done = 0;
     while (done < size) {
@@ -1668,9 +1671,11 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *b = out_buf(req, 0);
         if ((uint64_t)size > b->size) size = (int64_t)b->size;
         kernel_watch_write("file read", b->addr, (uint64_t)size);
-        #ifdef _WIN32
-                if (plat_guest_sparse_heap_enabled()) plat_commit(b->addr, (uint64_t)size);
-        #endif
+#ifdef _WIN32
+        if (plat_guest_sparse_heap_enabled()) plat_commit(b->addr, (uint64_t)size);
+#elif defined(__ORBIS__)
+        plat_commit(b->addr, (uint64_t)size);  // (the kernel writes there: backed first, the PS4 backs on first touch)
+#endif
         ssize_t n;
         if (f->patched) {  // (test warp)
             n = off >= 0 && (uint64_t)off < f->patched_size ? (ssize_t)((uint64_t)size < f->patched_size - (uint64_t)off ? (uint64_t)size : f->patched_size - (uint64_t)off) : 0;
@@ -1693,6 +1698,9 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *a = in_buf(req, 0);
         if (strstr(f->path, "savedata"))
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
+#ifdef __ORBIS__
+        plat_commit(a->addr, (uint64_t)size);  // (the kernel reads it: an untouched buffer has no memory yet)
+#endif
         int tries = 0;
         ssize_t w;
         while ((w = pwrite(f->fd, (void *)(uintptr_t)a->addr, (size_t)size, off)) < 0 && fs_retry(&tries, "write", f->path)) {}

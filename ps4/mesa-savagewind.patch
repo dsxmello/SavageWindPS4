@@ -1,0 +1,171 @@
+diff -ruN a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+--- a/src/amd/common/ac_ps4_drm.c	2026-11-06 00:05:43.818928980 -0300
++++ b/src/amd/common/ac_ps4_drm.c	2026-11-06 00:05:51.182603969 -0300
+@@ -107,6 +107,7 @@
+    bool tail_mapped;   /* the overflow tail is mapped after the buffer (see PS4_TAIL) */
+    bool tail_reported;
+    bool gpu_ro; /* mapped GPU read-only (command buffers) */
++   bool user;   /* (Savage Wind) user memory: the caller's own GPU-mapped direct memory, at its own address */
+ };
+ 
+ struct amdgpu_va {
+@@ -1051,6 +1052,28 @@
+    return handle && handle < num ? __atomic_load_n(&bos[handle], __ATOMIC_ACQUIRE) : NULL;
+ }
+ 
++/* Gives bo a handle in the device's table. */
++static void
++ps4_add_bo(ac_drm_device *dev, struct amdgpu_bo *bo)
++{
++   simple_mtx_lock(&dev->lock);
++   if (dev->num_bos + 1 >= dev->bos_cap) {
++      const unsigned cap = MAX2(dev->bos_cap * 2, 1024);
++      struct amdgpu_bo **bigger = calloc(cap, sizeof(*bigger));
++      if (dev->num_bos)
++         memcpy(bigger, dev->bos, dev->num_bos * sizeof(*bigger));
++      /* The old table is deliberately kept (see struct ac_drm_device). */
++      __atomic_store_n(&dev->bos, bigger, __ATOMIC_RELEASE);
++      dev->bos_cap = cap;
++   }
++   if (dev->num_bos == 0)
++      dev->num_bos = 1; /* handle 0 is invalid */
++   bo->handle = dev->num_bos;
++   dev->bos[bo->handle] = bo;
++   __atomic_store_n(&dev->num_bos, bo->handle + 1, __ATOMIC_RELEASE);
++   simple_mtx_unlock(&dev->lock);
++}
++
+ int
+ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *out)
+ {
+@@ -1089,22 +1112,7 @@
+       return -ENOMEM;
+    }
+ 
+-   simple_mtx_lock(&dev->lock);
+-   if (dev->num_bos + 1 >= dev->bos_cap) {
+-      const unsigned cap = MAX2(dev->bos_cap * 2, 1024);
+-      struct amdgpu_bo **bigger = calloc(cap, sizeof(*bigger));
+-      if (dev->num_bos)
+-         memcpy(bigger, dev->bos, dev->num_bos * sizeof(*bigger));
+-      /* The old table is deliberately kept (see struct ac_drm_device). */
+-      __atomic_store_n(&dev->bos, bigger, __ATOMIC_RELEASE);
+-      dev->bos_cap = cap;
+-   }
+-   if (dev->num_bos == 0)
+-      dev->num_bos = 1; /* handle 0 is invalid */
+-   bo->handle = dev->num_bos;
+-   dev->bos[bo->handle] = bo;
+-   __atomic_store_n(&dev->num_bos, bo->handle + 1, __ATOMIC_RELEASE);
+-   simple_mtx_unlock(&dev->lock);
++   ps4_add_bo(dev, bo);
+ 
+    out->abo = bo;
+    __atomic_add_fetch(&dev->bo_bytes, bo->size, __ATOMIC_RELAXED);
+@@ -1132,6 +1140,12 @@
+ static void
+ ps4_do_free(ac_drm_device *dev, struct amdgpu_bo *b)
+ {
++   if (b->user) { /* not ours: nothing to release */
++      ps4_record(dev, 'F', b, b->last_va, b->size);
++      dev->bos[b->handle] = NULL;
++      free(b);
++      return;
++   }
+    if (b->cpu_owned)
+       sceKernelMunmap(b->cpu, b->size);
+    const int rr = sceKernelReleaseDirectMemory(b->phys, b->size + PS4_TAIL);
+@@ -1173,9 +1187,28 @@
+ int
+ ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_drm_bo *bo)
+ {
+-   /* GPU addresses are CPU addresses here, but user memory can't be mapped a second time at the
+-    * address the winsys picks. */
+-   return -ENOSYS;
++   /* GPU addresses are CPU addresses here, and user memory can't be mapped a second time at an
++    * address the winsys picks. (Savage Wind) Memory the caller mapped GPU readable / writable
++    * itself (direct memory with PROT_GPU_RW, possibly backed only in part) is used where it is:
++    * the winsys gives the buffer the pointer as its GPU address (radv_amdgpu_winsys_bo_from_ptr),
++    * and mapping / unmapping it does nothing. */
++   if (((uintptr_t)cpu & (PS4_PAGE - 1)) || !size)
++      return -EINVAL;
++   struct amdgpu_bo *b = calloc(1, sizeof(*b));
++   if (!b)
++      return -ENOMEM;
++   b->size = align64(size, PS4_PAGE);
++   b->phys = -1;
++   b->pad_phys = -1;
++   b->cpu = cpu;
++   b->last_va = (uintptr_t)cpu;
++   b->heap = AMDGPU_GEM_DOMAIN_GTT;
++   b->user = true;
++   ps4_add_bo(dev, b);
++   bo->abo = b;
++   ps4_log("radv/ps4: bo %u: user memory at %p (%llu MB)\n", b->handle, cpu,
++           (unsigned long long)(b->size >> 20));
++   return 0;
+ }
+ 
+ int
+@@ -1292,6 +1325,14 @@
+    switch (ops) {
+    case AMDGPU_VA_OP_MAP: {
+       struct amdgpu_bo *b = ps4_bo(dev, bo_handle);
++      if (b && b->user) { /* already mapped, at its own address (ac_drm_create_bo_from_user_mem) */
++         if (addr != (uintptr_t)b->cpu + offset || offset + size > b->size) {
++            ps4_log("radv/ps4: user memory bo %u mapped at %#llx, not at itself (%p)\n", b->handle,
++                    (unsigned long long)addr, b->cpu);
++            return -EINVAL;
++         }
++         return 0;
++      }
+       if (!b || offset + size > b->size) {
+          ps4_log("radv/ps4: map of bo %u (+%#llx, %#llx bytes) out of range\n", bo_handle,
+                  (unsigned long long)offset, (unsigned long long)size);
+@@ -1383,6 +1424,8 @@
+              uint64_t size)
+ {
+    {
++      if (b && b->user) /* (the caller's memory stays as it is) */
++         return 0;
+       if (b && b->tail_mapped && addr == b->last_va) {
+          ps4_check_tail(dev, b, "unmapped");
+          b->tail_mapped = false;
+@@ -2071,6 +2114,14 @@
+ static void
+ ps4_note_submit(uint64_t dwords, unsigned links, int64_t ns)
+ {
++   /* Only with SAVAGEWIND_GNM_STATS set: each report went through sceKernelDebugOutText on this
++    * thread, and the frame after one ran ~15-30 ms late (29 of 33 reports in Savage Wind's open
++    * world). */
++   static int on = -1;
++   if (on < 0)
++      on = getenv("SAVAGEWIND_GNM_STATS") != NULL;
++   if (!on)
++      return;
+    const int big = dwords >= 4096;
+    ps4_submit_stats.count[big]++;
+    ps4_submit_stats.dwords[big] += dwords;
+diff -ruN a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c	2026-11-06 00:05:43.819640414 -0300
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c	2026-11-06 00:05:43.821463436 -0300
+@@ -917,11 +917,19 @@
+     */
+    vm_alignment = radv_amdgpu_get_optimal_vm_alignment(ws, size, ws->info.gart_page_size);
+ 
++#ifdef __PS4__
++   /* (Savage Wind) GPU addresses are CPU addresses: the memory is used where it is, at its own address
++    * (ac_drm_create_bo_from_user_mem), outside the winsys's address windows. */
++   (void)vm_alignment;
++   va = (uint64_t)(uintptr_t)pointer;
++   va_handle = NULL;
++#else
+    if (ac_drm_va_range_alloc(ws->dev, amdgpu_gpu_va_range_general, size, vm_alignment, 0, &va, &va_handle,
+                              AMDGPU_VA_RANGE_HIGH)) {
+       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       PS4_FAIL(error_va_alloc);
+    }
++#endif
+ 
+    uint32_t kms_handle = 0;
+    ASSERTED int r = ac_drm_bo_export(ws->dev, buf_handle, amdgpu_bo_handle_type_kms, &kms_handle);

@@ -1,145 +1,148 @@
-<p align="center"><img src="docs/media/banner.png" alt="Savage Wind" width="640"></p>
-
-<p align="center">
-  <a href="https://github.com/Revivedx/SavageWindRecomp/releases/latest"><b>Download</b></a> ·
-  <a href="#get-started">Get started</a> ·
-  <a href="docs/STATUS.md">Status</a> ·
-  <a href="docs/FAQ.md">FAQ</a> ·
-  <a href="https://github.com/Revivedx/SavageWindRecomp/issues">Issues</a> ·
-  <a href="CHANGELOG.md">Changelog</a>
-</p>
-
-**Savage Wind Recomp** is a work-in-progress static recompilation of *The Legend of Zelda: Breath of the Wild*
-(Nintendo Switch, version 1.9.0) into a native application for Windows and Linux, built from your own copy of the
-game.
-
-<p align="center">
-  <img src="https://i.imgur.com/BaTJyr9.jpg" alt="Screenshot of Savage Wind" width="24%">
-  <img src="https://i.imgur.com/USibLkg.jpg" alt="Screenshot of Savage Wind" width="24%">
-  <img src="https://i.imgur.com/z6dHHLP.jpg" alt="Screenshot of Savage Wind" width="24%">
-  <img src="https://i.imgur.com/p12wEHG.jpg" alt="Screenshot of Savage Wind" width="24%">
-</p>
-<p align="center"><sub>Screenshots taken in Savage Wind. The game is © Nintendo; you need your own copy to run it.</sub></p>
-
-<p align="center"><img src="docs/media/progress/overall.svg" alt="Overall progress" width="420"></p>
+# Savage Wind PS4
 
 > [!IMPORTANT]
-> **No game files are included.** You need your own legally obtained copy of the game, updated to **version 1.9.0**
-> and dumped from **your own** Nintendo Switch. This project does not provide game files, keys, firmware, dumping or
-> decryption tools, or instructions on how to obtain them. The game code is recompiled locally, on your machine,
-> from your files.
+> **This project is made almost entirely with AI.** Nearly all of the code, tooling, reverse engineering and
+> documentation here is written by an AI (Anthropic's Claude, through Claude Code), directed, tested and reviewed by
+> a human. It builds on [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp) and
+> [LAS Recomp](https://github.com/peiikai/LASRecomp), which were made the same way. If you don't trust code written by
+> AI, you can simply ignore this project. As with anything on the internet, you run the code at your own discretion.
 
-> [!NOTE]
-> **Made almost entirely with AI.** Nearly all of the code, tooling, reverse engineering and documentation is written
-> by an AI (Anthropic's Claude, through Claude Code), directed, tested and reviewed by a human. It builds on
-> [LAS Recomp](https://github.com/peiikai/LASRecomp), made the same way. If you don't trust code written by AI, you
-> can simply ignore this project.
+**Savage Wind PS4** is a port of [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp) - a static
+recompilation of *The Legend of Zelda: Breath of the Wild* (Nintendo Switch) - to a jailbroken **PlayStation 4**
+running GoldHEN. The game code is recompiled on your PC from your own copy of the game and linked into a PS4
+homebrew package; on the console it runs natively on the Jaguar CPU, with Vulkan (Mesa's RADV) on the PS4's own GPU.
+
+This is an independent port. It is not affiliated with the Savage Wind Recomp project, and bugs found here should be
+reported here, not upstream. For the Windows and Linux versions, go to
+[Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp).
 
 > [!WARNING]
-> **This is an alpha.** The whole game can be finished from start to end, but expect bugs and crashes in some places,
-> and some mechanics that break above 30 fps ([#425](https://github.com/Revivedx/SavageWindRecomp/issues/425)). If a
-> cutscene freezes or breaks, lower the frame rate to 30 fps for that scene.
+> **Work in progress, for testers.** It boots, plays the Shrine of Resurrection and the open world with sound,
+> saving and loading, but it runs below 30 fps in heavy places and it hasn't been played far. Performance work is
+> ongoing (see [Status](#status)).
 
-## Features
-
-- The whole game and both DLC, from your own copy
-- Frame rates from 30 to 360 fps, or your display's own rate
-- Resolutions up to 4K and beyond, ultrawide, and FSR 1 upscaling
-- Graphics presets from Potato, below console quality, to Savage, far beyond it
-- Longer draw distance, sharper shadows, adjustable field of view, colour grading and HDR
-- Keyboard and mouse with real mouse camera, and any controller, gyro included
-- Button prompts that match your device
-- Save profiles, backups, and Wii U / Cemu save import
-- Steam Deck and PC handhelds
-- Photo mode, accessibility options and cheats
-
-## Get started
-
-**You need:** your own game files (see [Game files](docs/game-files.md)), Windows 10 or later or Linux on x86-64, a
-GPU with Vulkan 1.3, 16 GB of RAM, a CPU with SSE4.2 (AVX2 runs faster) and about 20 GB of free disk space.
-
-1. Download the latest build from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases/latest):
-   - **Windows:** the file ending in `windows.zip`. Extract it to a folder you can write to, not Program Files.
-   - **Linux and Steam Deck:** the file ending in `x86_64.AppImage`. Make it executable and run it
-     ([docs/linux.md](docs/linux.md)).
-   - **Linux on ARM:** the file ending in `aarch64.AppImage`. It is highly experimental.
-2. Start it and choose the folder with your extracted game (`exefs/` and `romfs/`). Then choose **Set up game files**.
-   It checks the version, copies the files and recompiles the game code once, about 15 minutes on a 12-thread CPU.
-   Your own files aren't changed.
-3. Play. Settings and languages are in the game's Options. **Savage Wind Configuration** has your game files and the
-   rest of the settings.
-
-**Updating:** from version 0.5.1 on, Savage Wind Configuration updates it in one click, on Windows and in the Linux
-AppImages. Before that, extract the new zip over the old folder or use the new AppImage. Your game files, saves and
-settings stay.
-
-Something wrong? See the [FAQ](docs/FAQ.md), which also lists the known issues.
-
-## Saves
-
-Saves are in the `save` folder of Savage Wind's data folder: next to `savagewind.exe` on Windows, and in
-`~/.local/share/savagewind/save/` on Linux and the Steam Deck. To back them up or move them, close the game and copy
-the whole folder. More in [Saves](docs/saves.md), including profiles and Wii U / Cemu import.
+> [!NOTE]
+> **No game files or game code are included, and no package will ever be shared.** You need your own legally
+> obtained copy of the game, dumped from **your own** Nintendo Switch. The PS4 package you build contains code
+> generated from your game: it is for your own use only. This project does not include, and will not provide, game
+> files, keys, firmware, dumping or decryption tools, packages with the game code, or instructions on how to obtain
+> any of them.
 
 ## Status
 
-| Area | Share | Progress |
-|---|---|---|
-| Core game | 45% | ![Core game](docs/media/progress/area-core-game.svg) |
-| Platforms and input | 15% | ![Platforms and input](docs/media/progress/area-platforms-and-input.svg) |
-| Performance | 15% | ![Performance](docs/media/progress/area-performance.svg) |
-| Graphics options | 12% | ![Graphics options](docs/media/progress/area-graphics-options.svg) |
-| Player features | 13% | ![Player features](docs/media/progress/area-player-features.svg) |
+Measured on a base PS4 (1.6 GHz Jaguar):
 
-Every part, what it means and how the average is calculated: [Status](docs/STATUS.md).
+| Place | fps |
+|---|---|
+| Shrine of Resurrection | ~43 |
+| Open world (Great Plateau, standing still) | ~28 |
+| Kakariko Village (4,000-5,000 draws a frame) | 21-23 |
 
-## Controls
+The game is CPU-bound on the PS4 (the GPU is about half busy). The goal is a steady 30 fps; 60 isn't realistic on
+the Jaguar. What's being worked on, in order:
 
-Any controller SDL knows works. Keyboard and mouse defaults:
+- Jaguar-specific tuning: 128-bit SIMD only, no 64-bit multiplies in hashing, fewer pointer chases in the
+  translation of the game's command lists to Vulkan.
+- Less waiting between the game's threads (core scheduling, threads kept on one CPU cluster).
+- Profile-guided optimization (PGO) of the final code: +12% in earlier tests.
 
-| Action | Key | Action | Key |
-|---|---|---|---|
-| Move | W A S D | Camera | Mouse |
-| Jump | Space | Sprint / back | Left Shift |
-| Interact | E | Attack | Left click |
-| Shield | Right click | Bow | F |
-| Rune | Q | Throw | R |
-| Inventory | Tab | Map | M |
+The numbers above were measured on the earlier port, based on Savage Wind Recomp's Alpha 3 with game version 1.8.2.
+The port is now being moved onto Savage Wind Recomp 0.5.2, which needs game version **1.9.0**: work in progress, not
+yet built with the game code nor run on the console.
 
-Every action can be rebound in the game's Options. All the keys: [Controls](docs/controls.md).
+## What you need
 
-## Found a bug?
+- A PS4 with [GoldHEN](https://github.com/GoldHEN/GoldHEN) (package installer and FTP server on port 2121).
+- A Linux PC (x86-64) to build: the game code is generated and compiled there, not on the console.
+- Your own *Breath of the Wild* and its update, extracted from your own console:
+  - the **ExeFS** (`main`, `main.npdm`, `rtld`, `sdk`, `subsdk0`)
+  - the **RomFS** with the update applied (base game and update merged)
+- About 16 GB free on the console for the game files (the RomFS image is ~15 GB).
 
-Read the [FAQ](docs/FAQ.md) first: issues about something it already covers are closed right away. Use the latest
-release and game version 1.9.0, search the [existing issues](https://github.com/Revivedx/SavageWindRecomp/issues?q=is%3Aissue),
-and [open one](https://github.com/Revivedx/SavageWindRecomp/issues/new/choose) with your `savagewind.log`. On a crash
-or a cutscene bug, attach your zipped `save` folder too. Reports without these are closed after 7 days.
+## Building
 
-## Contributing and building
+The full guide is [docs/ps4.md](docs/ps4.md). In short:
 
-Open pull requests against the [`test`](https://github.com/Revivedx/SavageWindRecomp/tree/test) branch, which has
-everything ahead of the latest release. See [CONTRIBUTING.md](CONTRIBUTING.md). To build from source:
-[Windows](docs/BUILD-windows.md) and [Linux](docs/linux.md).
+1. The PS4 toolchain (OpenOrbis SDK, libc++ / glslang sysroot, Mesa RADV, DolphinPS4's Vulkan stack) is the one
+   [TriAevum PS4](https://github.com/dsxmello/TriAevumPS4) sets up; `ps4/env.sh` points at it (`PS4_VK_ROOT`).
+2. Put your files in `extracted/` (`exefs/` and `romfs/`), then on the PC:
+
+   ```sh
+   SW_PROMOTE_VMAX=6 make gen GEN=generated-v GENARGS=--promote   # recompile the game code (C, for the Jaguar)
+   build/savagewind extracted --build-romfs                       # the RomFS image (extracted/romfs.bin, ~15 GB)
+   SW_GENERATED=$PWD/generated-v ps4/build.sh                     # dependencies, then the eboot (~13 min)
+   ps4/package.sh 00.01                                           # -> $SW_PS4_BUILD/out/IV0000-SVWD00001_00-....pkg
+   ```
+
+   (`build/savagewind` is the PC build, needed once for `--build-romfs`: see
+   [Savage Wind Recomp's Linux guide](https://github.com/Revivedx/SavageWindRecomp/blob/main/docs/linux.md).)
+3. Optional, for speed: a profile-guided build (`PGO=generate`, play, `ps4/pgo-merge.sh`, `PGO=use`), described in
+   [docs/ps4.md](docs/ps4.md).
+
+## Installing and playing
+
+1. Send your game files to the console by FTP:
+
+   ```
+   /data/savagewind/extracted/exefs/     main, main.npdm, rtld, sdk, subsdk0
+   /data/savagewind/extracted/romfs.bin  the RomFS image
+   ```
+
+2. Send the package (for example to `/data/pkg/`) and install it with GoldHEN's package installer.
+3. Start **Savage Wind** from the home screen. It goes straight into the game (there's no start screen on the PS4).
+
+Everything the game writes - saves, caches, settings and the log (`savagewind.log`, and `savagewind.prev.log` for the
+run before) - is in `/data/savagewind/`. Debug and test switches go in `/data/savagewind/env.txt`, one `KEY=VALUE` a
+line, read at start (see [docs/ps4.md](docs/ps4.md)).
+
+The PS4 controller works as the game's controller, by button position. The first time an effect is seen it can
+stutter while its pipeline compiles; the cache in `/data/savagewind/cache` keeps it for later.
+
+## Testing
+
+- `tools/test_vkrec.c` checks the Vulkan recording thread's ring on the PC (order, copies, wrap-around, full ring),
+  under ThreadSanitizer or AddressSanitizer; the build command is at its top.
+- `tools/test_softfma.c` checks the software FMA the Jaguar uses (it has no FMA instructions) bit for bit.
 
 ## Respect copyright
 
 - *The Legend of Zelda: Breath of the Wild* is © Nintendo. This is a fan project. It is not affiliated with,
-  endorsed by or sponsored by Nintendo. *Nintendo Switch* and *The Legend of Zelda* are trademarks of Nintendo.
+  endorsed by or sponsored by Nintendo or Sony. *Nintendo Switch* and *The Legend of Zelda* are trademarks of
+  Nintendo; *PlayStation* is a trademark of Sony Interactive Entertainment.
 - This repository contains no game files, no game code (also not the C code the recompiler generates from it), no
-  assets, no fonts, no keys - and release builds won't either.
-- The game code you generate and the build made from it contain Nintendo's code. They are for your own use only:
+  assets, no fonts from the game, no keys, and no packages.
+- The game code you generate and the package made from it contain Nintendo's code. They are for your own use only:
   don't share them, upload them or ship them.
-- Issues, pull requests or discussions that contain game files, keys, generated code or links to pirated copies
-  will be removed. Piracy is not supported in any way.
-- Follow the copyright laws of your country. Dumping a game you own for personal use is legal in some countries and
-  not in others; that is your responsibility.
+- Issues, pull requests or discussions that contain game files, keys, generated code, packages or links to pirated
+  copies will be removed. Piracy is not supported in any way.
+- Follow the copyright laws of your country. Dumping a game you own for personal use, and running homebrew on a
+  console you own, are legal in some countries and not in others; that is your responsibility.
 
-## Credits and license
+## Credits
 
-Built on **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by peiikai (MIT), with
-[TotK Recomp](https://github.com/valentderah/totk-pc-recomp) by Valiantsin Dzerakh (MIT) and
-[Ryujinx](https://github.com/Ryujinx/Ryujinx) (MIT) as references. Full list and the licenses of what releases bundle:
-[Credits](docs/third-party.md).
+- **[Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp)** by Revivedx and its contributors - the
+  recompiled game, its runtime and everything on the PC side (MIT).
+- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by peiikai - the recompiler and runtime Savage Wind is built
+  on (MIT).
+- PS4 side: the [OpenOrbis PS4 Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain), the PS4 Vulkan stack
+  of DolphinPS4 and dusklight-ps4 (Mesa's RADV on GNM), [GoldHEN](https://github.com/GoldHEN/GoldHEN), and
+  [TriAevum PS4](https://github.com/dsxmello/TriAevumPS4), where that toolchain and the PS4 work were first set up.
+- "Taming the Jaguar" (Andreas Fredriksson, Insomniac Games, GDC 2016) - the guide to the PS4's CPU used for tuning.
+- Upstream's credits apply too: [Ryujinx](https://github.com/Ryujinx/Ryujinx), [envytools](https://github.com/envytools/envytools),
+  [Switchbrew](https://switchbrew.org), [Ghidra](https://github.com/NationalSecurityAgency/ghidra) and the
+  [Switch Loader](https://github.com/Adubbz/Ghidra-Switch-Loader).
+- Libraries: [Mesa](https://mesa3d.org) (MIT), [SDL 3](https://libsdl.org) (zlib), [FFmpeg](https://ffmpeg.org)
+  (LGPL), [glslang](https://github.com/KhronosGroup/glslang) (BSD-3 and others), [volk](https://github.com/zeux/volk)
+  (MIT), [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
+  [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT),
+  [SMAA](https://github.com/iryoku/smaa) (MIT), [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)
+  and [CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS) (MIT), [Fira Sans](https://github.com/mozilla/Fira) and
+  [Noto Sans Thai](https://github.com/notofonts/thai) (SIL OFL 1.1), [stb](https://github.com/nothings/stb)
+  (public domain / MIT), [Capstone](https://www.capstone-engine.org) (BSD), [Unicorn](https://www.unicorn-engine.org)
+  (GPL 2.0), [python-lz4](https://github.com/python-lz4/python-lz4) (BSD).
 
-Savage Wind Recomp's own code is under the [MIT License](LICENSE). The license covers this project's code only: it
-grants nothing for Nintendo's game, which you must supply yourself.
+## License
+
+The code is open source under the [MIT License](LICENSE), as are Savage Wind Recomp and LAS Recomp, on which it
+builds. Third-party components in `third_party/` keep their own licenses. The license covers this project's code
+only: it grants nothing for Nintendo's game, which you must supply yourself.

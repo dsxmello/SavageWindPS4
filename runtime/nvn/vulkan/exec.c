@@ -2085,8 +2085,13 @@ static void begin_pass(void) {
     // (nvnSyncWait) before it goes on: the two times added up, a fifth of the frames ran over 31.7 ms, and the game
     // went to 20 fps. A submission at a pass boundary every ~300 draws lets the GPU work on the frame meanwhile.
     // SAVAGEWIND_VK_SUBMIT_DRAWS=<n> sets the count (0: one submission per command list, as before).
+#ifdef __ORBIS__
+    const int submit_def = 100;  // (PS4 open world: 300 draws 27.76 fps, 100 28.28, 50 28.0)
+#else
+    const int submit_def = 300;
+#endif
     static int submit_draws = -1;
-    if (submit_draws < 0) submit_draws = getenv("SAVAGEWIND_VK_SUBMIT_DRAWS") ? atoi(getenv("SAVAGEWIND_VK_SUBMIT_DRAWS")) : 300;
+    if (submit_draws < 0) submit_draws = getenv("SAVAGEWIND_VK_SUBMIT_DRAWS") ? atoi(getenv("SAVAGEWIND_VK_SUBMIT_DRAWS")) : submit_def;
     // Not once the list has recorded a shader that stores to guest memory (global memory, the imported heap): run
     // on the GPU while the rest of the list is translated, it wrote memory this thread was copying for later draws and
     // dispatches (uniforms, vertices), they got half-written data, and the GPU faulted on a write (~1 world load in
@@ -5554,6 +5559,9 @@ static VkDescriptorBufferInfo gmem_info_hi(void) {
 // Switch. Falls back to copies outside the heap or without the import; SAVAGEWIND_VK_COPY_VERTICES=1 forces copies.
 static bool gsnap_verts(void);
 static uint64_t gsnap_verts_max(void);
+#ifdef __ORBIS__
+static uint8_t gd_backed[HEAP_MAX >> 21];  // (PS4) the 2 MiB heap chunks known backed
+#endif
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     static int copy = -1;
     if (copy < 0) copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
@@ -5583,6 +5591,18 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (gmem_sparse) gmem_info();
     if (!gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
+#ifdef __ORBIS__
+    // (PS4: the heap gets memory on first touch; a GPU read of a chunk without any faults the GPU.) The chunks found
+    // backed are remembered, one byte each: plat_commit ~4 times a draw was ~2% of the queue thread. Every chunk of
+    // the range, not only its ends. Chunks stay backed until a reboot (vk_exec_reset).
+    uint64_t c0 = (addr - HEAP_BASE) >> 21, c1 = (addr + size - 1 - HEAP_BASE) >> 21;
+    for (uint64_t c = c0; c <= c1; c++)
+        if (!gd_backed[c]) {
+            plat_commit(addr, size);
+            for (c = c0; c <= c1; c++) gd_backed[c] = 1;
+            break;
+        }
+#endif
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;
@@ -6295,6 +6315,9 @@ static uint32_t g_cs_cap, g_cs_n;
 // address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
 // programs, shared copies - and the heap import: its pages are replaced (re-imported on first use).
 void vk_exec_reset(void) {
+#ifdef __ORBIS__
+    memset(gd_backed, 0, sizeof gd_backed);  // (the heap's memory went back to the system)
+#endif
     map_background_target = NULL;
     map_background_frame = map_background_main_frame = UINT64_MAX;
     oq_counting = false;

@@ -90,6 +90,9 @@ static void choose_root(char *root, size_t n, bool *dev, const char *start, cons
     } else {
 #ifdef _WIN32
         snprintf(root, n, "%s", exe_dir);
+#elif defined(__ORBIS__)
+        (void)exe_dir;
+        snprintf(root, n, PS4_DATA_DIR);  // (/app0, the package, is read-only)
 #elif defined(__linux__)
         // (the AppImage is read-only): $XDG_DATA_HOME/savagewind, ~/.local/share/savagewind by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");

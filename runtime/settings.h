@@ -43,7 +43,11 @@ enum { SHADOW_CONSOLE = 0, SHADOW_HIGH = 1 /* 2048 */, SHADOW_ULTRA = 2 /* 4096 
 enum { PERF_OFF = 0, PERF_FPS = 1, PERF_FULL = 2 };
 // Frame rate (Video > Frame rate; runtime/hle/framepace.c): frames per second, 0 = no limit. The game's clock is the
 // same at every rate. The console runs the game at 30.
+#ifdef __ORBIS__
+#define FPS_DEFAULT 30  // (the PS4 holds ~30 in the open world: at 60 the game flipped between its 30 and 60 fps modes)
+#else
 #define FPS_DEFAULT 60
+#endif
 #define FPS_CHOICES {0, 30, 60, 90, 120, 144, 165, 240, 360}
 // PC handhelds (settings_handheld): 40 for a screen at 40 or 80 Hz, 45 at 90 Hz; no Off, no Match display. Their
 // faster screens add their own rates (#712: 90 on a Steam Deck OLED, 120 on a ROG Ally, 144 on a Legion Go): those of

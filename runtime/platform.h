@@ -1,5 +1,5 @@
 // Host OS layer: everything the runtime needs that differs between macOS and Windows.
-// Implementations: runtime/platform/macos.c, runtime/platform/windows.c (the Makefile picks one).
+// Implementations: runtime/platform/{macos,windows,linux,ps4}.c (the Makefile, or ps4/CMakeLists.txt, picks one).
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -7,8 +7,13 @@
 
 #ifdef _WIN32
 #include "platform/win_compat.h"
+#elif defined(__ORBIS__)
+#include "platform/ps4_compat.h"
 #elif defined(__linux__)
 #include "platform/linux_compat.h"
+#endif
+#ifndef __ORBIS__
+#define plat_cond_wait_ms(cv, m, ms) pthread_cond_wait(cv, m)  // (the PS4's: platform/ps4_compat.h)
 #endif
 
 #ifdef __cplusplus
@@ -75,7 +80,10 @@ void plat_init(void);                                // first thing in main()
 bool plat_exe_path(char *buf, size_t size);
 const char *plat_log_path(void);  // the log file this run writes ("": stderr goes to a console, pipe or file)
 void plat_exec(char *const argv[]);  // replace the process (NULL = same command line); returns only on failure
-#if defined(_WIN32) || defined(__linux__)
+#ifdef __ORBIS__
+void *plat_alloc_stack(size_t size);  // a host thread's stack (its lowest address), backed; NULL when out of memory
+#endif
+#if defined(_WIN32) || defined(__linux__) || defined(__ORBIS__)
 void plat_terminate(void);  // end the process now, skipping DLL teardown (exit status 0)
 // Windows: false turns off the accessibility shortcuts (Shift five times: Sticky Keys) where their feature is off,
 // true puts them back as they were (the game's window has the focus or not). Elsewhere nothing.

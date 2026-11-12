@@ -25,8 +25,14 @@ static uint8_t *read_file(const char *path, size_t *len) {
     *len = ftell(f);
     fseek(f, 0, SEEK_SET);
     uint8_t *p = malloc(*len);
-    fread(p, 1, *len, f);
+    size_t got = 0, n;
+    while (p && got < *len && (n = fread(p + got, 1, *len - got, f)) > 0) got += n;
     fclose(f);
+    if (!p || got != *len) FATAL("%s: read %zu of %zu bytes\n", path, got, *len);
+    // size and FNV-1a, to compare with the PC's copy (a file damaged on its way, e.g. an FTP transfer in ASCII mode)
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < *len; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    LOG("[loader] %s: %zu bytes, fnv %016llx\n", path, *len, (unsigned long long)h);
     return p;
 }
 

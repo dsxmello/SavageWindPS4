@@ -9,7 +9,11 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#ifdef __ORBIS__
+#include <volk.h>  // (no Vulkan loader on the PS4: RADV is linked in, its entry points come through volk; device.c)
+#else
 #include <vulkan/vulkan.h>
+#endif
 #if __has_include(<vma/vk_mem_alloc.h>)
 #include <vma/vk_mem_alloc.h>
 #else
@@ -18,6 +22,13 @@
 
 #include "../nvn.h"
 #include "../maxwell/shader.h"
+#ifdef __ORBIS__
+// SDL's clock is clock_gettime, a system call on the PS4: the backend's timings (SAVAGEWIND_VK_PROF, GPU waits) read
+// the platform's TSC clock instead (platform/ps4.c plat_now_ns; differences only, never compared with SDL's)
+#include <SDL3/SDL_timer.h>
+uint64_t plat_now_ns(void);
+#define SDL_GetTicksNS() plat_now_ns()
+#endif
 
 void vk_device_fault_report(void);
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) { vk_device_fault_report(); \
