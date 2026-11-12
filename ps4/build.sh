@@ -46,5 +46,5 @@ else  # (a configured tree keeps its SW_GENERATED unless given; the Mesa build f
     cmake -S "$HERE" -B "$build" -DPS4_MESA_BUILD="$PS4_MESA_BUILD" ${SW_GENERATED+-DSW_GENERATED="$SW_GENERATED"} \
         "${pgo_args[@]}" >/dev/null
 fi
-ninja -C "$build" -k 0
+ninja -C "$build" ${JOBS:+-j"$JOBS"} -k 0  # (JOBS: fewer at once on a PC short of memory)
 ls -la "$build/savagewind_eboot/eboot.bin"

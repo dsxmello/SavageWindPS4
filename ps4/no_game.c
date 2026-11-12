@@ -13,6 +13,7 @@
 #include <SDL3/SDL.h>
 
 const GameLibTables *swgame_tables(void) { return NULL; }
+int simd_fma_unfused;  // (runtime/gamelib.c: the game code defines it when it is linked in)
 
 uint64_t plat_guest_backed_bytes(void);  // runtime/platform/ps4.c
 void ui_window_init(void);

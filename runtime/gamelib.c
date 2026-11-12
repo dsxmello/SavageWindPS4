@@ -250,10 +250,14 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
 
 const GameLibTables *gamelib_tables(void) { return g_tables; }
 
+#ifdef __ORBIS__
+extern int simd_fma_unfused;  // (one program on the PS4: the game code's, tools/gamelib_entry.c, or ps4/no_game.c's)
+#else
 #ifndef _WIN32
 __attribute__((visibility("hidden")))
 #endif
 int simd_fma_unfused;  // (the runtime's own copy, for its code built without FMA instructions)
+#endif
 
 void gamelib_sync(void) {
     static int env = -2, cur = -1;
