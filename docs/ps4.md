@@ -79,9 +79,13 @@ The package is installed with GoldHEN's package installer. Everything the title 
 Your game files go there too, sent by FTP (GoldHEN's FTP server, port 2121):
 
 ```
-/data/savagewind/extracted/exefs/     main, main.npdm, rtld, sdk, subsdk0
-/data/savagewind/extracted/romfs.bin  the RomFS image (build/savagewind extracted --build-romfs on the PC)
+/data/savagewind/extracted/exefs/     main, main.npdm, rtld, sdk, subsdk0 (version 1.9.0)
+/data/savagewind/extracted/romfs/     the RomFS folder, base game and update merged (read in place)
+/data/savagewind/extracted/aoc1/      optional: the DLC's RomFS folders (docs/game-files.md)
+/data/savagewind/extracted/aoc2/
 ```
+
+A `romfs.bin` image from the earlier port (Alpha 3) is only read when there is no `romfs/` folder.
 
 ## First test (package without the game code)
 

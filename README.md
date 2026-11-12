@@ -52,14 +52,12 @@ GPU.
 
    ```sh
    make gen                                        # recompile the game code (generated/)
-   build/savagewind extracted --build-romfs        # the RomFS image (extracted/romfs.bin, ~15 GB)
    SW_GENERATED=$PWD/generated ps4/build.sh        # dependencies, then the eboot
    ps4/package.sh 00.01                            # -> $SW_PS4_BUILD/out/IV0000-SVWD00001_00-....pkg
    ```
 
-   (`build/savagewind` is the PC build, needed once for `--build-romfs`: see [docs/linux.md](docs/linux.md).)
-3. Send your game files to the console by FTP: `exefs/` to `/data/savagewind/extracted/exefs/` and the RomFS image to
-   `/data/savagewind/extracted/romfs.bin`.
+3. Send your game files to the console by FTP, as they are: `exefs/`, `romfs/` and the DLC's `aoc1/` and `aoc2/`
+   (optional) into `/data/savagewind/extracted/`. The game reads the RomFS straight from its folder.
 4. Send the package (for example to `/data/pkg/`), install it with GoldHEN's package installer and start
    **Savage Wind** from the home screen. It goes straight into the game.
 
