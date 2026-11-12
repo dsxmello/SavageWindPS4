@@ -46,7 +46,6 @@ int32_t sceKernelAvailableDirectMemorySize(off_t search_start, off_t search_end,
 void ac_ps4_get_memory(uint64_t *garlic_bytes, uint64_t *onion_bytes, uint64_t *buffers);  // (RADV, ac_ps4_drm.c)
 void ps4_heap_usage(size_t *main_mb, size_t *overflow_mb, size_t *overflow_cap_mb, size_t *used_mb);
 void ps4_heap_top(char *out, size_t cap);  // (ps4/ps4_runtime.cpp: sampled heap profile)  // (ps4/ps4_runtime.cpp)
-uint32_t nvn_texture_count(uint32_t *inits);                                        // (nvn/objects.c)
 
 #define SCE_KERNEL_WB_ONION 0      // CPU cached, GPU coherent: the guest's memory is mostly CPU work
 #define SCE_KERNEL_MAP_FIXED 0x10
@@ -141,6 +140,40 @@ void plat_commit(uint64_t addr, uint64_t size) {
 
 uint64_t plat_guest_backed_bytes(void) { return atomic_load(&g_backed); }
 
+// The guest unmapped [addr, addr+size): it reads as zero if touched again. The chunks stay backed (the GPU may hold
+// them: exec.c gd_backed), only their bytes are cleared; the memory goes back at a reboot (plat_reset_guest).
+void plat_decommit(uint64_t addr, uint64_t size) {
+    if (!size || addr >= g_hi || addr + size <= g_lo) return;
+    uint64_t a = addr < g_lo ? g_lo : addr, e = addr + size > g_hi ? g_hi : addr + size;
+    while (a < e) {
+        uint64_t i = (a - g_lo) / CHUNK, ce = g_lo + (i + 1) * CHUNK, n = (ce < e ? ce : e) - a;
+        if (atomic_load(&g_state[i]) == 2) memset((void *)(uintptr_t)a, 0, n);
+        a += n;
+    }
+}
+
+// The first run of backed chunks at or after addr and before end (reading it never backs anything)
+bool plat_committed_range(uint64_t addr, uint64_t end, uint64_t *a, uint64_t *e) {
+    if (addr < g_lo) addr = g_lo;
+    if (end > g_hi) end = g_hi;
+    for (; addr < end; addr = (addr & ~(CHUNK - 1)) + CHUNK)
+        if (atomic_load(&g_state[(addr - g_lo) / CHUNK]) == 2) {
+            uint64_t x = addr;
+            while (x < end && atomic_load(&g_state[(x - g_lo) / CHUNK]) == 2) x = (x & ~(CHUNK - 1)) + CHUNK;
+            *a = addr, *e = x < end ? x : end;
+            return true;
+        }
+    return false;
+}
+
+long plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, size_t max) {
+    (void)addr, (void)size, (void)pages, (void)max;
+    return -1;  // (not tracked)
+}
+int plat_any_written(uint64_t addr, uint64_t size) { (void)addr, (void)size; return -1; }
+bool plat_guest_sparse_heap_enabled(void) { return false; }
+void plat_accessibility_shortcuts(bool allow) { (void)allow; }
+
 // Host stacks of guest threads (runtime/kernel.c thread_start) and of the host's own threads (pthread_create, below):
 // direct memory mapped anywhere, CPU only, all of it backed (no alternate signal stack here: a fault on a thread's own
 // stack couldn't be handled), with an unmapped 2 MiB guard below each (an overflow faults instead of writing over
@@ -224,6 +257,14 @@ static uint64_t pin_mask(const char *name, uint64_t def) {
     return m ? m : def;
 }
 // role: 0 a guest thread, 3 the game's main thread, 1 the queue thread, 2 vkrec, -1 any other host thread
+// The CPUs the game's threads may use (pin_init: the process's own; ksync.c and record.c size their spins by it)
+int plat_cpu_count(void) {
+    pthread_once(&g_pin_once, pin_init);
+    int n = __builtin_popcountll(g_cpus);
+    return n ? n : 6;
+}
+void plat_cpu_placement(void) {}  // (ps4_pin_thread places each thread by its role)
+
 void ps4_pin_thread(int role) {
     pthread_once(&g_pin_once, pin_init);
     if (!g_cpus) return;
@@ -384,6 +425,8 @@ void plat_sleep_until_ns(uint64_t t) {
 }
 
 // PS4 thread priorities: 256 (highest) - 767 (lowest), 700 by default.
+void plat_wait_until_ns(uint64_t t) { plat_sleep_until_ns(t); }
+
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;
     scePthreadSetprio(scePthreadSelf(), 300);
@@ -434,7 +477,6 @@ static void load_system_modules(void) {
 // Hang watchdog: the log stays the same size for 10 s -> every guest thread's state to it (kernel_dump_threads), at
 // most 5 times, 30 s apart. The console has no debugger to attach; this shows what each thread waits in.
 void kernel_dump_threads(const char *why);
-void kernel_log_core_waits(void);
 // Where the console's direct memory went: the guest's, the host stacks', RADV's buffers and images, and what's left
 // (the largest free 2 MiB-aligned block: a guest chunk needs one)
 static void log_memory(const char *why) {
@@ -446,10 +488,9 @@ static void log_memory(const char *why) {
     // (the host heap: 512 MB of system flexible memory, then an overflow heap in direct memory; full = abort)
     size_t heap = 0, over = 0, over_cap = 0, used = 0;
     ps4_heap_usage(&heap, &over, &over_cap, &used);
-    uint32_t tex_inits = 0, tex = nvn_texture_count(&tex_inits);
-    fprintf(stderr, "[plat] memory%s: host heap %zu MB + overflow %zu of %zu MB, %zu MB in use (%u textures of %u inits), guest %llu MB, stacks %llu MB (%d; deepest used: guest threads %llu KB, host "
+    fprintf(stderr, "[plat] memory%s: host heap %zu MB + overflow %zu of %zu MB, %zu MB in use, guest %llu MB, stacks %llu MB (%d; deepest used: guest threads %llu KB, host "
             "threads %llu KB), GPU %llu MB garlic + %llu MB onion (%llu buffers), largest free block %llu MB of %llu MB\n",
-            why, heap, over, over_cap, used, tex, tex_inits, (unsigned long long)(atomic_load(&g_backed) >> 20), (unsigned long long)(atomic_load(&g_stack_bytes) >> 20),
+            why, heap, over, over_cap, used, (unsigned long long)(atomic_load(&g_backed) >> 20), (unsigned long long)(atomic_load(&g_stack_bytes) >> 20),
             atomic_load(&g_nstacks), (unsigned long long)(stack_used_max(true) >> 10),
             (unsigned long long)(stack_used_max(false) >> 10), (unsigned long long)(garlic >> 20),
             (unsigned long long)(onion >> 20), (unsigned long long)bufs, (unsigned long long)(big >> 20),
@@ -469,7 +510,7 @@ static void *hang_watch(void *arg) {
         if (fstat(2, &st) != 0) continue;
         if (st.st_size != last) {
             static unsigned secs;
-            if (++secs % 30 == 0) { log_memory(""); kernel_log_core_waits(); fstat(2, &st); }  // (only while the log moves: hangs stay quiet)
+            if (++secs % 30 == 0) { log_memory(""); fstat(2, &st); }  // (only while the log moves: hangs stay quiet)
             last = st.st_size; still = 0; wait = 10;
             continue;
         }
@@ -545,6 +586,8 @@ void plat_first_frame(void) {
     static bool done;
     if (!done) { done = true; sceSystemServiceHideSplashScreen(); }
 }
+
+const char *plat_log_path(void) { return PS4_DATA_DIR "/savagewind.log"; }
 
 bool plat_exe_path(char *buf, size_t size) {
     snprintf(buf, size, PS4_APP_DIR "/eboot.bin");

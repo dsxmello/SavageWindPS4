@@ -10,6 +10,7 @@ mkdir -p "$SW_PS4_BUILD"/{src,build,downloads,out}
 [ -f "$SW_PS4_BUILD/build/sdl3/libSDL3.a" ] || "$HERE/build-sdl3.sh"
 "$HERE/build-mesa.sh"  # (ninja: only what changed)
 [ -f "$SW_PS4_BUILD/ffmpeg/lib/libavcodec.a" ] || "$HERE/build-ffmpeg.sh"
+[ -f "$PS4_SYSROOT/glslang/lib/libglslang.a" ] || [ -f "$SW_PS4_BUILD/glslang/lib/libglslang.a" ] || "$HERE/build-glslang.sh"
 [ -d "$SW_PS4_BUILD/src/volk" ] ||
     git clone -q --depth 1 --branch vulkan-sdk-1.4.335.0 https://github.com/zeux/volk "$SW_PS4_BUILD/src/volk"
 

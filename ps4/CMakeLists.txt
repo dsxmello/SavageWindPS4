@@ -55,12 +55,22 @@ set(SW ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(SW_GENERATED "" CACHE PATH "The generated game code (make gen's generated/); empty: a runtime-only eboot")
 set(SW_VERSION "0.1.0" CACHE STRING "Version shown in the log")
 
+# SW_SOURCE: the source this build is made from, in the log's first line (runtime/main.c; the Makefile's)
+execute_process(COMMAND git -C ${SW} log -1 "--format=commit %h, tree %t" OUTPUT_VARIABLE SW_SOURCE
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if (NOT SW_SOURCE)
+    set(SW_SOURCE "unknown source")
+endif ()
+
 # ------------------------------------------------------------------------------------------------ dependencies --
 set(SDL3_SRC ${SW_PS4_BUILD}/src/sdl3)
 set(SDL3_LIB ${SW_PS4_BUILD}/build/sdl3/libSDL3.a)
 set(FFMPEG ${SW_PS4_BUILD}/ffmpeg)
 set(VOLK ${SW_PS4_BUILD}/src/volk)
 set(GLSLANG ${PS4_SYSROOT}/glslang)
+if (EXISTS ${SW_PS4_BUILD}/glslang/lib/libglslang.a)  # (ps4/build-glslang.sh: a toolchain without it)
+    set(GLSLANG ${SW_PS4_BUILD}/glslang)
+endif ()
 set(IMGUI ${SW}/third_party/imgui)
 foreach (f ${SDL3_LIB} ${FFMPEG}/lib/libavcodec.a ${VOLK}/volk.h ${GLSLANG}/lib/libglslang.a)
     if (NOT EXISTS ${f})
@@ -73,6 +83,8 @@ file(GLOB RT_SRC CONFIGURE_DEPENDS
     ${SW}/runtime/*.c ${SW}/runtime/hle/*.c ${SW}/runtime/services/*.c
     ${SW}/runtime/nvn/*.c ${SW}/runtime/nvn/maxwell/*.c
     ${SW}/runtime/nvn/vulkan/*.c ${SW}/runtime/nvn/vulkan/*.cpp)
+# (the PC's FSR 3 frame generation and FSR API: ps4_vk_stubs.c instead)
+list(FILTER RT_SRC EXCLUDE REGEX "/runtime/nvn/vulkan/(framegen|fsr_api)\\.cpp$")
 file(GLOB UI_SRC CONFIGURE_DEPENDS ${SW}/runtime/ui/*.mm)
 set(IMGUI_SRC ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
     ${IMGUI}/backends/imgui_impl_sdl3.cpp ${IMGUI}/backends/imgui_impl_vulkan.cpp)
@@ -136,6 +148,7 @@ add_executable(savagewind
     ${SW}/runtime/platform/ps4.c
     ${CMAKE_CURRENT_SOURCE_DIR}/ps4_paths.c
     ${CMAKE_CURRENT_SOURCE_DIR}/ps4_pad.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ps4_vk_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/shaderc_glslang.c
     ${VOLK}/volk.c
     ${PS4_RUNTIME_SOURCES})
@@ -146,7 +159,8 @@ target_include_directories(savagewind SYSTEM PRIVATE
     ${SDL3_SRC}/include ${FFMPEG}/include ${GLSLANG}/include ${PS4_MESA_SRC}/include ${VOLK} ${SW}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/shaderc)
 target_compile_definitions(savagewind PRIVATE
-    VK_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_VOLK GAMELIB_ID="${GAMELIB_ID}" SAVAGEWIND_PS4_VERSION="${SW_VERSION}")
+    VK_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_VOLK GAMELIB_ID="${GAMELIB_ID}" SAVAGEWIND_PS4_VERSION="${SW_VERSION}"
+    SW_SOURCE="${SW_SOURCE}")
 target_compile_options(savagewind PRIVATE
     -march=btver2 -fno-omit-frame-pointer -fno-strict-aliasing
     $<$<COMPILE_LANGUAGE:C>:-std=gnu17 -O2 -g -Wall -Wno-unused-function -Wno-format>

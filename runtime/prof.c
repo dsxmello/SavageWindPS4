@@ -101,6 +101,8 @@ static uint64_t os_thread_id(void) {
     return GetCurrentThreadId();
 #elif defined(__linux__)
     return (uint64_t)syscall(SYS_gettid);
+#elif defined(__ORBIS__)
+    return (uint64_t)(uintptr_t)pthread_self();
 #else
     uint64_t t = 0;
     pthread_threadid_np(NULL, &t);

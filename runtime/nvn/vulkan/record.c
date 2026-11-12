@@ -181,6 +181,9 @@ static uint64_t spin_for_work(uint64_t t) {  // the published end once it moves 
 static void *run(void *arg) {
     (void)arg;
     prof_thread_name("vk-record");
+#ifdef __ORBIS__
+    { extern void ps4_profile_thread(const char *name); ps4_profile_thread("vkrec"); }  // (its own CPU: platform/ps4.c)
+#endif
     extern void control_prof_thread(const char *name);  // runtime/control_prof.c (`threads`)
     control_prof_thread("recorder");
     uint64_t t = 0;
