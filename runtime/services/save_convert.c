@@ -294,13 +294,15 @@ static bool copy_file(const char *from, const char *to, MadeList *made, ScReport
         fail(r, SC_IO, "out of memory");
         return false;
     }
-    static __thread uint8_t chunk[1 << 16];
+    uint8_t *chunk = malloc(1 << 16);  // (not __thread: the PS4 gives every thread a copy of the TLS block)
+    bool mem = chunk != NULL, ok = mem;
     size_t got;
-    bool ok = true;
-    while (ok && (got = fread(chunk, 1, sizeof chunk, in)) > 0) ok = fwrite(chunk, 1, got, out) == got;
+    while (ok && (got = fread(chunk, 1, 1 << 16, in)) > 0) ok = fwrite(chunk, 1, got, out) == got;
+    free(chunk);
     bool read_bad = ferror(in);
     fclose(in);
     ok = fclose(out) == 0 && ok;
+    if (!mem) { fail(r, SC_IO, "out of memory"); return false; }
     if (read_bad) { fail(r, SC_IO, "%s: read error", from); return false; }
     if (!ok) { fail(r, SC_IO, "%s: could not be written (disk full?)", to); return false; }
     keep_time(from, to);

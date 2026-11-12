@@ -1,6 +1,7 @@
 // SHA-256 and ECDSA P-256 verification (runtime/update_crypto.h).
 #include "update_crypto.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ------------------------------------------------------------------ SHA-256
@@ -75,12 +76,14 @@ void uc_sha256_final(UcSha256 *c, uint8_t out[32]) {
 bool uc_sha256_file(const char *path, uint8_t out[32]) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
-    static __thread uint8_t buf[1 << 16];
+    uint8_t *buf = malloc(1 << 16);  // (not __thread: the PS4 gives every thread a copy of the TLS block, from the little memory pthread objects get)
+    if (!buf) { fclose(f); return false; }
     UcSha256 c;
     uc_sha256_init(&c);
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) uc_sha256_update(&c, buf, n);
+    while ((n = fread(buf, 1, 1 << 16, f)) > 0) uc_sha256_update(&c, buf, n);
     bool ok = !ferror(f);
+    free(buf);
     fclose(f);
     if (ok) uc_sha256_final(&c, out);
     return ok;
