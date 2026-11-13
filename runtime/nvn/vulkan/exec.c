@@ -1532,6 +1532,11 @@ static uint64_t g_cur_fs_hash;  // (the fragment shader of the draw in progress:
 static Readback readbacks[64];
 static int nreadbacks;
 static pthread_mutex_t readback_lock = PTHREAD_MUTEX_INITIALIZER;
+// Buffers of finished readbacks, kept for the next ones (readback_lock held): BOTW reads its linear targets back every
+// frame (~1 MB), and a buffer made and destroyed each time cost a VMA block's vkAllocateMemory / vkFreeMemory on the
+// queue thread on the PS4 (radv_bo_create + radv_free_memory: ~1/3 of its waits).
+static struct { VkBuffer buf; VmaAllocation mem; const uint8_t *ptr; uint64_t size; } rb_free[16];
+static int nrb_free;
 static NvnTexture *pass_linear[8];  // the pass's linear color targets (begin_pass), with their views
 static NvnTextureView pass_linear_view[8];
 static bool pass_linear_has_view[8];
@@ -1698,7 +1703,8 @@ static void readbacks_apply(void) {
             for (uint32_t y = 0; y < r->rows; y++)
                 memcpy((void *)(uintptr_t)(r->addr + y * r->stride), r->ptr + (uint64_t)y * r->row, r->row);
             guest_copy_flush();
-            vmaDestroyBuffer(g_vk.vma, r->buf, r->mem);
+            if (nrb_free < 16) rb_free[nrb_free++] = (__typeof__(rb_free[0])){r->buf, r->mem, r->ptr, (uint64_t)r->row * r->rows};
+            else vmaDestroyBuffer(g_vk.vma, r->buf, r->mem);
             int m = linear_mem_find(r->addr, r->stride * r->rows);
             if (m >= 0) {
                 if (linear_mem[m].pending > 0) linear_mem[m].pending--;
@@ -1742,9 +1748,17 @@ static void readback_schedule(VkCommandBuffer cb, NvnTexture *t, const NvnTextur
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (uint64_t)row * h, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
-    VmaAllocationInfo info;
-    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &r->buf, &r->mem, &info) != VK_SUCCESS) { pthread_mutex_unlock(&readback_lock); return; }
-    r->ptr = info.pMappedData;
+    int k = -1;
+    for (int i = 0; i < nrb_free; i++)
+        if (rb_free[i].size >= bi.size && rb_free[i].size <= bi.size * 2 && (k < 0 || rb_free[i].size < rb_free[k].size)) k = i;
+    if (k >= 0) {
+        r->buf = rb_free[k].buf, r->mem = rb_free[k].mem, r->ptr = rb_free[k].ptr;
+        rb_free[k] = rb_free[--nrb_free];
+    } else {
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &r->buf, &r->mem, &info) != VK_SUCCESS) { pthread_mutex_unlock(&readback_lock); return; }
+        r->ptr = info.pMappedData;
+    }
     r->seq = vk_pending_seq();
     r->addr = t->addr;
     r->stride = stride;
