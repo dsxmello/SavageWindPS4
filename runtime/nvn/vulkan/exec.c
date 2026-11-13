@@ -185,10 +185,27 @@ void gpu_unlock(void) { pthread_mutex_unlock(&gpu_mutex); }
 static void readbacks_apply(void);
 static void hc_cpu_wrote(uint64_t addr, uint64_t size);
 static bool hc_all_stale;  // a shader stored to guest memory where gw_note could not tell: the next list copies all geometry
-uint64_t vk_completed_seq(void) {
+static uint64_t completed_now(void) {
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
     return v;
+}
+// The GPU's progress as last read. On the PS4 each read takes the winsys's device lock (ac_ps4_drm.c ps4_query), which
+// the recorder holds through its submits: the queue thread waited there several times a draw (~5% of it). So the
+// recorder reads it (record.c: after each submit and when idle, never against itself) and others take that value while
+// it is under 2 ms old. The value only grows: an old one only means "less done" - callers wait (vk_wait_seq asks
+// afresh) or recycle later.
+static _Atomic uint64_t completed_last, completed_ns;
+uint64_t vk_completed_refresh(void) {
+    uint64_t v = completed_now(), seen = atomic_load_explicit(&completed_last, memory_order_relaxed);
+    while (v > seen && !atomic_compare_exchange_weak_explicit(&completed_last, &seen, v, memory_order_relaxed, memory_order_relaxed)) {}
+    atomic_store_explicit(&completed_ns, SDL_GetTicksNS(), memory_order_release);
+    return v > seen ? v : seen;
+}
+uint64_t vk_completed_seq(void) {
+    if (SDL_GetTicksNS() - atomic_load_explicit(&completed_ns, memory_order_acquire) < 2000000)
+        return atomic_load_explicit(&completed_last, memory_order_relaxed);
+    return vk_completed_refresh();
 }
 
 void vk_wait_seq(uint64_t seq) {
@@ -201,7 +218,7 @@ void vk_wait_seq(uint64_t seq) {
     }
     // (NVIDIA's vkWaitSemaphores is not cheap even for a value already reached: ~6% of the submission thread went
     // there in the open world, recycling submission slots whose work had long finished)
-    if (vk_completed_seq() >= seq) { readbacks_apply(); return; }
+    if (vk_completed_seq() >= seq || completed_now() >= seq) { readbacks_apply(); return; }
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();

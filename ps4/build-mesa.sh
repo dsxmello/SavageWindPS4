@@ -31,7 +31,10 @@ done
 
 export PATH="$ROOT/mesa-venv/bin:$ROOT/host-tools/bin:$PATH"
 pc="$ROOT/mesa-pkgconfig"  # (libdrm headers only: written by TriAevum's build, read here)
-flags="'-target', 'x86_64-pc-freebsd12-elf', '-D_GNU_SOURCE', '-D__PS4__', '-D__OPENORBIS__',
+# PS4_WINSYS_DIAG=0: the winsys without its developer checks (IB chain checks before each submit, a scan of every live
+# buffer's tail every 256 submits under the device lock - ~50 ms each, the queue thread's GPU-progress reads waited
+# behind it -, GPU timestamps, submission stats). Errors and hang reports stay. SW_MESA_DIAG=1: the checks back.
+flags="'-target', 'x86_64-pc-freebsd12-elf', '-DPS4_WINSYS_DIAG=${SW_MESA_DIAG:-0}', '-D_GNU_SOURCE', '-D__PS4__', '-D__OPENORBIS__',
   '-D__ORBIS__', '-DPS4', '-D__BSD_VISIBLE', '-D_BSD_SOURCE', '-fPIC', '-funwind-tables',
   '-march=btver2', '-isysroot', '$OPENORBIS', '-isystem', '$SYSROOT/libc-overlay',
   '-isystem', '$DOLPHINPS4/port/mesa-overlay', '-I$ROOT/src/libdrm', '-I$ROOT/src/libdrm/include/drm',

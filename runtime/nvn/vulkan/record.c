@@ -178,6 +178,9 @@ static uint64_t spin_for_work(uint64_t t) {  // the published end once it moves 
     }
 }
 
+uint64_t vk_completed_refresh(void);  // exec.c
+static uint64_t completed_at;  // (R) when it last read the GPU's progress
+
 static void *run(void *arg) {
     (void)arg;
     prof_thread_name("vk-record");
@@ -209,6 +212,7 @@ static void *run(void *arg) {
         }
         if (prof) ADD(r_busy_ns, NOW() - t0);
         notify_done();  // caught up: drains and waiters
+        if (NOW() - completed_at > 100000) { vk_completed_refresh(); completed_at = NOW(); }  // (exec.c vk_completed_seq)
     }
     return NULL;
 }
