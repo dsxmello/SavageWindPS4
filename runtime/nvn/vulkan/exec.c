@@ -1049,6 +1049,10 @@ static void uub_note(uint64_t lo, uint64_t hi) {
     guest_copy_flush();  // (a range copies made before don't know; or no room: every update drops everything)
 }
 
+// Bytes of guest memory hashed (the "hash" field): linear targets before a pass (linear_target_sync), after a copy back
+// lands (readbacks), and textures' full hashes (textures.c upload_texture)
+static uint64_t stat_hash_sync, stat_hash_rb;
+
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
@@ -1265,6 +1269,12 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB)",
                  (unsigned long long)stat_uub, (unsigned long long)stat_uub_same, (unsigned long long)stat_gcopy_hit,
                  (unsigned long long)stat_gcopy_miss, stat_gcopy_bytes / 1048576.0);
+        extern uint64_t prof_tex_full_bytes;
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, ", hash MB: linear %.1f readback %.1f textures %.1f", stat_hash_sync / 1048576.0,
+                 stat_hash_rb / 1048576.0, prof_tex_full_bytes / 1048576.0);
+        stat_hash_sync = stat_hash_rb = 0;
+        if (!prof) prof_tex_full_bytes = 0;  // (VK_PROF: its own line reads and clears it)
         n = strlen(stats_text);
         if (stat_ubo_direct) snprintf(stats_text + n, sizeof stats_text - n, ", cbuf in place %llu", (unsigned long long)stat_ubo_direct);
         n = strlen(stats_text);
@@ -1542,6 +1552,7 @@ static void linear_target_sync(NvnTexture *t) {
     bool reload = false;
     if (i >= 0 && !linear_mem[i].pending) {  // (a copy back still in flight: the memory is the GPU's until it lands)
         uint64_t h = vk_hash_bytes((const void *)(uintptr_t)t->addr, size);
+        stat_hash_sync += size;
         reload = i >= n || h != linear_mem[i].hash || serial != linear_mem[i].serial;  // (first use: whatever the CPU put there)
         linear_mem[i].hash = h;
         linear_mem[i].serial = serial;
@@ -1675,6 +1686,7 @@ static void readbacks_apply(void) {
             if (m >= 0) {
                 if (linear_mem[m].pending > 0) linear_mem[m].pending--;
                 linear_mem[m].hash = vk_hash_bytes((const void *)(uintptr_t)r->addr, r->stride * r->rows);
+                stat_hash_rb += r->stride * r->rows;
                 linear_mem[m].serial = r->serial;
             }
         }
@@ -5562,10 +5574,10 @@ static uint64_t gsnap_verts_max(void);
 #ifdef __ORBIS__
 static uint8_t gd_backed[HEAP_MAX >> 21];  // (PS4) the 2 MiB heap chunks known backed
 #endif
-static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
-    static int copy = -1;
-    if (copy < 0) copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
-    if (copy || addr < HEAP_BASE) return false;
+static int gd_copy = -1;  // SAVAGEWIND_VK_COPY_VERTICES
+static __attribute__((noinline)) bool guest_direct_slow(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (gd_copy < 0) gd_copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
+    if (gd_copy || addr < HEAP_BASE) return false;
 #ifdef _WIN32
     if (plat_guest_sparse_heap_enabled() && g_vk.sparse_buffer && g_vk.sparse_queue &&
         g_vk.sparse_nonresident_strict && g_vk.sparse_host_import && addr < HEAP_BASE + HEAP_MAX &&
@@ -5606,6 +5618,25 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;
+}
+// ~6 calls a draw (indices, vertex streams, constant buffers): the usual case inline - in the imported heap and, on the
+// PS4, inside one chunk already known backed (the call itself was ~4% of the PS4's queue thread). The rest, and the
+// first call (gd_copy still unknown), go the slow way.
+static inline bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+#ifdef _WIN32
+    return guest_direct_slow(addr, size, buf, off);  // (the sparse heap's commit checks live there)
+#endif
+    uint64_t rel = addr - HEAP_BASE;  // (below the heap: huge, fails the first test)
+    if (__builtin_expect(rel < gmem_size && size && size <= gmem_size - rel && !gd_copy && !gmem_sparse && gmem_buf, 1)
+#ifdef __ORBIS__
+        && (rel >> 21) == ((rel + size - 1) >> 21) && gd_backed[rel >> 21]
+#endif
+    ) {
+        *buf = gmem_buf;
+        *off = rel;
+        return true;
+    }
+    return guest_direct_slow(addr, size, buf, off);
 }
 
 // ---- shaders that store to global memory, and the CPU's copies of guest memory
@@ -6522,17 +6553,23 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
 typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
 static SetEnt *setc;
 
+// Before the table: the last set of each layout (by a few slots), kept with its writes. ~85% of the draws in BOTW's
+// open world bind the same set for a stage as the draw before (only their dynamic offsets change), and comparing
+// ~700 hot bytes costs less than the two hashes and the probe (~5% of the PS4's queue thread).
+#define SETL_SLOTS 16
+static struct { VkDescriptorSetLayout layout; uint64_t seq; uint32_t n; VkDescriptorSet set; uint64_t key[MAX_BIND][4]; } setl[SETL_SLOTS];
+
 static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_VK_NO_SET_CACHE") != NULL;
     stat_sets++;
     SetEnt *e = NULL;
+    __typeof__(setl[0]) *l = NULL;
     uint64_t seq = vk_pending_seq() + (setc_gen << 40), h = 0, h2 = 0;
-    if (!off) {
-        h = (uint64_t)(uintptr_t)layout;
-        h2 = h ^ 0x6A09E667F3BCC909ull;
+    if (!off && n <= MAX_BIND) {
+        uint64_t key[MAX_BIND][4];
         for (int i = 0; i < n; i++) {
-            uint64_t v[4];
+            uint64_t *v = key[i];
             v[0] = w[i].dstBinding | (uint64_t)w[i].descriptorType << 32;
             if (w[i].pImageInfo) {
                 v[1] = (uint64_t)(uintptr_t)w[i].pImageInfo->sampler;
@@ -6543,16 +6580,28 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
                 v[2] = w[i].pBufferInfo->offset;
                 v[3] = w[i].pBufferInfo->range;
             }
-            for (int k = 0; k < 4; k++) {
-                h = (h ^ v[k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-                h2 = (h2 ^ v[k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
-            }
         }
+        uint64_t lh = (uint64_t)(uintptr_t)layout;
+        l = &setl[(lh ^ (lh >> 7) ^ (lh >> 13)) & (SETL_SLOTS - 1)];
+        if (l->layout == layout && l->seq == seq && l->n == (uint32_t)n && !memcmp(l->key, key, (size_t)n * sizeof key[0])) {
+            stat_sets_reused++;
+            return l->set;
+        }
+        h = lh;
+        h2 = h ^ 0x6A09E667F3BCC909ull;
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < 4; k++) {
+                h = (h ^ key[i][k]) * 0x9E3779B97F4A7C15ull; h ^= h >> 29;
+                h2 = (h2 ^ key[i][k]) * 0xC2B2AE3D27D4EB4Full; h2 ^= h2 >> 31;
+            }
         h ^= h >> 32;
+        l->layout = layout; l->seq = seq; l->n = (uint32_t)n;
+        memcpy(l->key, key, (size_t)n * sizeof key[0]);
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);
         e = &setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
         if (e->seq == seq && e->hash == h && e->hash2 == h2 && e->layout == layout && e->n == (uint32_t)n) {
             stat_sets_reused++;
+            l->set = e->set;
             return e->set;
         }
     }
@@ -6563,6 +6612,7 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
         e->hash = h; e->hash2 = h2; e->layout = layout; e->set = ds; e->n = (uint32_t)n;
     }
+    if (l) l->set = ds;
     return ds;
 }
 
@@ -7845,8 +7895,8 @@ static void draw_(CmdRec *r, bool indexed) {
             last_fs = fs;
             // (by code address, like the program table: 512 bytes hashed byte by byte at every fragment shader change
             // cost 1% of the translation)
-            static struct { uint64_t fs, hash; } memo[512];
-            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 55);  // (code addresses are 256-aligned)
+            static struct { uint64_t fs, hash; } memo[4096];  // (512 collided: hmix still ~0.2% of the PS4's queue thread)
+            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 52);  // (code addresses are 256-aligned)
             if (fs && memo[ms].fs == fs) last_hash = memo[ms].hash;
             else {
                 last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
