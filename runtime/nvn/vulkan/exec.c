@@ -3,6 +3,7 @@
 #include <SDL3/SDL_cpuinfo.h>
 #include <SDL3/SDL_timer.h>
 #include <float.h>
+#include <sched.h>
 #include <math.h>
 #include <stdarg.h>
 #include <pthread.h>
@@ -3382,14 +3383,29 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     return p;
 }
 
-// The program and pipeline tables are shared by the translating threads: looked up and filled under these locks (only
-// when a thread's memo misses: most draws repeat the last program and pipeline).
-static pthread_mutex_t prog_lock = PTHREAD_MUTEX_INITIALIZER, pipe_lock = PTHREAD_MUTEX_INITIALIZER;
+// The program and pipeline tables are shared by the translating threads: looked up and filled under these locks (when a
+// thread's memo misses: the pipeline about every other draw). A spin lock: one atomic exchange when free - a
+// pthread_mutex pair cost the PS4's queue thread ~5% here (10.5 -> 11.0 us a draw). A holder can be building a program
+// (milliseconds): a waiter yields after a short spin.
+static _Atomic int prog_lock, pipe_lock;
+static void spin_lock(_Atomic int *l) {
+    for (int i = 0; atomic_exchange_explicit(l, 1, memory_order_acquire); i++) {
+        while (atomic_load_explicit(l, memory_order_relaxed)) {
+            if (++i > 200) { sched_yield(); i = 0; }
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+    }
+}
+static void spin_unlock(_Atomic int *l) { atomic_store_explicit(l, 0, memory_order_release); }
 static Prog *get_program_locked(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
 static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
-    pthread_mutex_lock(&prog_lock);
+    spin_lock(&prog_lock);
     Prog *p = get_program_locked(np, vkey, fkey);
-    pthread_mutex_unlock(&prog_lock);
+    spin_unlock(&prog_lock);
     return p;
 }
 static Prog *get_program_locked(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
@@ -8588,7 +8604,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!pp || memcmp(&pipe_memo.k, &k, sizeof k)) {
         uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
-        pthread_mutex_lock(&pipe_lock);
+        spin_lock(&pipe_lock);
         if (!pipe_tab) pipe_tab_grow();
         uint32_t pslot = pipe_slot_of(ph, pipe_cap);
         while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (pipe_cap - 1);
@@ -8608,7 +8624,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (ready) { pp->pipe = ready; atomic_store(&pp->state, 1); atomic_fetch_add(&stat_warm, 1); }
             else if (sync_shaders() || !link_now(pp)) run_job(build_pipeline, pp);  // (asynchronous: a link alone is done here)
         }
-        pthread_mutex_unlock(&pipe_lock);
+        spin_unlock(&pipe_lock);
         pipe_memo.k = k;
         pipe_memo.pp = pp;
     }
