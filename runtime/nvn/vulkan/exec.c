@@ -42,10 +42,205 @@
 #include "../../perfcount.h"
 #include "../hud_scale.h"
 
+// ================================================================== translation context
+// What one translating thread works with: the NVN state the commands set, the render pass in progress, the draw in
+// progress, the copies of guest memory the list shares. Reached through g_tx (a pointer per thread; one context, the
+// queue thread's, for now); the old names are macros for its fields, so the code using them reads as before.
+typedef struct {
+    NvnTexture *color[8];
+    NvnTextureView cview[8];
+    uint8_t has_cview[8];
+    int ncolor;
+    NvnTexture *depth;
+    NvnTextureView dview;
+    uint8_t has_dview;
+} RtState;
+
+typedef struct { uint64_t addr, size; } Range;
+
+// The NVN state the commands set (exec_list), what draws read.
+typedef struct {
+    RtState rt;
+    bool rt_dirty;
+    NvnProgram *program;
+    uint8_t blend[8][8];
+    uint32_t channel_mask;
+    uint8_t color_state[4], ds[8], ms[0x18], poly[4];
+    float poly_offset[3];
+    float line_width;
+    uint32_t attrib[16];
+    int nattrib;
+    uint32_t stream[16][2];
+    int nstream;
+    Range vbuf[16], ubuf[6][18], sbuf[6][16];
+    uint64_t tex[6][32], img[6][8];
+    NvnDescPool *tpool, *spool;
+    float viewport[16][4];
+    int32_t scissor[16][4];
+    float depth_range[16][2];
+    float blend_color[4];
+    uint32_t stencil_ref[2], stencil_mask[2], stencil_vmask[2];
+    bool prim_restart;
+    uint32_t restart_index;
+    bool depth_clamp;
+    bool rasterizer_discard;  // nvnCommandBufferSetRasterizerDiscard: draw() skips draws (no transform feedback here)
+    uint64_t copy_row_stride, copy_image_stride;
+} NvnState;
+#define GCOPY_TAB 4096
+#define UUB_MAX 64
+#define DET_TAB 8192
+typedef struct Tx {
+    NvnState st;
+    TexBackend *pass_fbl[8];  // (g_vk.feedback_layout) its targets moved to ATTACHMENT_FEEDBACK_LOOP_OPTIMAL
+    int pass_nfbl;
+    TexBackend *pass_block[8];  // its targets drawn through a view of a compressed image's blocks (vk_block_flush)
+    int pass_nblock;
+    bool in_pass;
+    bool bar_other;
+    VkImage bar_img[64];
+    VkImageAspectFlags bar_aspect[64];
+    int bar_n;
+    bool vtx_hazard;
+    float pass_sx, pass_sy;
+    float vp_sx, vp_sy, vp_ox, vp_oy;
+    float tex_sc[2][64][2];
+    uint32_t tex_wh[2][64][2];
+    VkFormat pass_color[8], pass_depth, pass_stencil;
+    uint32_t pass_ncolor, pass_samples, pass_w, pass_h;
+    int pass_mvec;
+    NvnTexture *pass_linear[8];  // the pass's linear color targets (begin_pass), with their views
+    NvnTextureView pass_linear_view[8];
+    bool pass_linear_has_view[8];
+    int pass_nlinear;
+    struct { uint64_t key; uint8_t written; bool used; } det_tab[DET_TAB];
+    uint64_t pass_key;
+    uint8_t pass_detached;
+    uint8_t det_draw;  // (during resolve_feedback) the slots the draw's pass leaves out: not attachments then
+    NvnTexture *feedback_tex[4];
+    VkImageView feedback_view[4];
+    bool feedback_any_type[4];  // the view fits every lookup type (a restricted view of the image itself)
+    int nfeedback;
+    uint64_t g_cur_fs_hash;  // (the fragment shader of the draw in progress: defined with the draw code below)
+    NvnTexture *fbrun_tex[4];
+    int nfbrun;
+    unsigned fb_draws;
+    struct { uint32_t gw, gh; float s; } sdw_fix;  // (the draw in progress; s 0: it samples no bigger shadow map)
+    struct { uint32_t gw, gh; float sx, sy; uint32_t tw, th, aw, ah; } up_fix;  // (the draw in progress; sx 0: not such a draw)
+    struct { uint64_t addr, size, gen, serial, mask; int chunk; VkSpan span; } gcopy[GCOPY_TAB];
+    uint64_t gcopy_gen;
+    struct { uint64_t lo, hi, serial; } uubt[UUB_MAX];  // ranges UpdateUniformBuffer wrote, with the last update's count
+    int nuub;
+    uint64_t uub_serial;
+} Tx;
+static Tx tx_main = {.bar_other = true, .vtx_hazard = true, .pass_sx = 1, .pass_sy = 1, .vp_sx = 1, .vp_sy = 1, .vp_ox = 0, .vp_oy = 0, .pass_samples = 1, .pass_mvec = -1, .gcopy_gen = 1};
+static _Thread_local Tx *g_tx __attribute__((tls_model("initial-exec"))) = &tx_main;
+#define st (g_tx->st)
+#define pass_fbl (g_tx->pass_fbl)
+#define pass_nfbl (g_tx->pass_nfbl)
+#define pass_block (g_tx->pass_block)
+#define pass_nblock (g_tx->pass_nblock)
+#define in_pass (g_tx->in_pass)
+#define bar_other (g_tx->bar_other)
+#define bar_img (g_tx->bar_img)
+#define bar_aspect (g_tx->bar_aspect)
+#define bar_n (g_tx->bar_n)
+#define vtx_hazard (g_tx->vtx_hazard)
+#define pass_sx (g_tx->pass_sx)
+#define pass_sy (g_tx->pass_sy)
+#define vp_sx (g_tx->vp_sx)
+#define vp_sy (g_tx->vp_sy)
+#define vp_ox (g_tx->vp_ox)
+#define vp_oy (g_tx->vp_oy)
+#define tex_sc (g_tx->tex_sc)
+#define tex_wh (g_tx->tex_wh)
+#define pass_color (g_tx->pass_color)
+#define pass_depth (g_tx->pass_depth)
+#define pass_stencil (g_tx->pass_stencil)
+#define pass_ncolor (g_tx->pass_ncolor)
+#define pass_samples (g_tx->pass_samples)
+#define pass_w (g_tx->pass_w)
+#define pass_h (g_tx->pass_h)
+#define pass_mvec (g_tx->pass_mvec)
+#define pass_linear (g_tx->pass_linear)
+#define pass_linear_view (g_tx->pass_linear_view)
+#define pass_linear_has_view (g_tx->pass_linear_has_view)
+#define pass_nlinear (g_tx->pass_nlinear)
+#define det_tab (g_tx->det_tab)
+#define pass_key (g_tx->pass_key)
+#define pass_detached (g_tx->pass_detached)
+#define det_draw (g_tx->det_draw)
+#define feedback_tex (g_tx->feedback_tex)
+#define feedback_view (g_tx->feedback_view)
+#define feedback_any_type (g_tx->feedback_any_type)
+#define nfeedback (g_tx->nfeedback)
+#define g_cur_fs_hash (g_tx->g_cur_fs_hash)
+#define fbrun_tex (g_tx->fbrun_tex)
+#define nfbrun (g_tx->nfbrun)
+#define fb_draws (g_tx->fb_draws)
+#define sdw_fix (g_tx->sdw_fix)
+#define up_fix (g_tx->up_fix)
+#define gcopy (g_tx->gcopy)
+#define gcopy_gen (g_tx->gcopy_gen)
+#define uubt (g_tx->uubt)
+#define nuub (g_tx->nuub)
+#define uub_serial (g_tx->uub_serial)
+
+
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
 static uint64_t stat_links_now;    // pipelines linked on the render thread within the frame's budget (link_now)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t draws_total;  // (every draw since the start, never reset: vk_draw_total)
+
+// (measuring) SAVAGEWIND_VK_PAR_STATS=1: how a frame would split for translation on several threads. The frame is cut at
+// each operation that has to stay in order with the CPU or with what was translated before it (a feedback snapshot,
+// a linear-target readback, an occlusion query, a copy, a dispatch, a draw whose shader stores to guest memory); the
+// runs of draws between cuts ("segments") are what workers could translate side by side. A "[par]" line every 120
+// presents: segments and draws by segment size, how much of the translation time fell in segments of 32+ draws, the
+// cuts by kind, passes, clears, barriers and fences per frame, and images created.
+enum { PB_FEEDBACK, PB_READBACK, PB_QUERY, PB_COPY, PB_DISPATCH, PB_GMEM, PB_N };
+static const char *const par_names[PB_N] = {"feedback", "readback", "query", "copy", "dispatch", "gmem-store"};
+static int par_on = -1;
+static uint64_t par_t0;
+static uint32_t par_draws;  // draws in the segment in progress
+static struct { uint64_t segs, draws, ns, ns_big, draws_big, hist[8], hist_draws[8], cut[PB_N], clears, barriers, fences, passes; } par;
+uint64_t g_par_images;  // (textures.c create_image)
+static void par_cut(int why) {
+    if (par_on <= 0) return;
+    uint64_t now = SDL_GetTicksNS();
+    if (why >= 0) par.cut[why]++;
+    if (par_draws) {
+        uint64_t dt = par_t0 ? now - par_t0 : 0;
+        int b = 0;
+        while (b < 7 && (1u << (b + 1)) <= par_draws) b++;  // 1, 2-3, 4-7, ... 128+
+        par.segs++, par.draws += par_draws, par.ns += dt, par.hist[b]++, par.hist_draws[b] += par_draws;
+        if (par_draws >= 32) par.ns_big += dt, par.draws_big += par_draws;
+    }
+    par_draws = 0;
+    par_t0 = now;
+}
+static void par_frame(void) {
+    if (par_on < 0) par_on = getenv("SAVAGEWIND_VK_PAR_STATS") != NULL;
+    if (par_on <= 0) return;
+    par_cut(-1);  // (a present ends the segment)
+    static int n;
+    static uint64_t images0;
+    if (++n % 120) return;
+    char buf[1024];
+    int o = snprintf(buf, sizeof buf, "[par] per frame: %.0f draws in %.1f segments; draws in segments of 32+: %.0f%%, their time %.0f%% of "
+                     "the segments' %.1f ms; draws by segment size (1,2,4,8,16,32,64,128+):",
+                     par.draws / 120.0, par.segs / 120.0, par.draws ? 100.0 * par.draws_big / par.draws : 0,
+                     par.ns ? 100.0 * par.ns_big / par.ns : 0, par.ns / 120.0 / 1e6);
+    for (int i = 0; i < 8; i++) o += snprintf(buf + o, sizeof buf - o, " %.0f", par.hist_draws[i] / 120.0);
+    o += snprintf(buf + o, sizeof buf - o, "; cuts:");
+    for (int i = 0; i < PB_N; i++) o += snprintf(buf + o, sizeof buf - o, " %s %.1f", par_names[i], par.cut[i] / 120.0);
+    snprintf(buf + o, sizeof buf - o, "; passes %.1f, clears %.1f, barriers %.1f, fences %.1f, images made %llu",
+             par.passes / 120.0, par.clears / 120.0, par.barriers / 120.0, par.fences / 120.0,
+             (unsigned long long)(g_par_images - images0));
+    LOG("%s\n", buf);
+    images0 = g_par_images;
+    memset(&par, 0, sizeof par);
+}
+
 uint64_t vk_draw_total(void) { return draws_total; }  // (device.c boot_held: how much the game draws a frame)
 static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
 static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
@@ -58,10 +253,6 @@ static bool pass_ds_written;         // a draw of the current pass wrote depth o
 static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
 static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since the pass began or its last feedback barrier
 static uint8_t pass_feedback;        // the color targets (bits) the current pass began with a feedback loop enabled
-static TexBackend *pass_fbl[8];      // (g_vk.feedback_layout) its targets moved to ATTACHMENT_FEEDBACK_LOOP_OPTIMAL
-static int pass_nfbl;
-static TexBackend *pass_block[8];    // its targets drawn through a view of a compressed image's blocks (vk_block_flush)
-static int pass_nblock;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
@@ -165,7 +356,6 @@ static uint64_t gmem_sparse_bind_seq;
 static uint64_t deferred_seq;  // (seq_lock; renderer_wait_seq, GPU_OVERLAP) a fence the game was told is done whose
                                // submission wasn't waited for
 static uint64_t oneshot_seq;   // (seq_lock) the latest submission with a one-off readback: a wait on it is never deferred
-static bool in_pass;
 static bool pass_void;  // the pass in progress has nothing to draw into: not begun, its draws and clears skipped (begin_pass)
 static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
 static bool chunk_hold;       // a shader that stores to guest memory was recorded since the last submission
@@ -300,17 +490,12 @@ VkCommandBuffer vk_upload_cmd(void) {
 // invalidates the whole L2, as the driver can't tell the writes were coherent with it (RADV: radv_src_access_flush
 // adds AC_BARRIER_INV_L2 without an image), an image barrier doesn't (radv_image_is_l2_coherent).
 // SAVAGEWIND_VK_FULL_PASS_BARRIER=1: a full barrier before every pass, as before.
-static bool bar_other = true;
-static VkImage bar_img[64];
-static VkImageAspectFlags bar_aspect[64];
-static int bar_n;
 
 void vk_pass_barrier_forget(void) { bar_other = true; }
 
 // Pass barriers (begin_pass, SAVAGEWIND_VK_BARRIER_FRAG): GPU work outside passes (copies, dispatches, clears; each
 // preceded by a full barrier, below) or a draw that stores to memory may have written what a later pass's vertex stage
 // reads (vertex data, instance data a compute shader culled): the next pass begins behind a full barrier then.
-static bool vtx_hazard = true;
 static bool after_dispatch;  // nothing recorded since the last dispatch but its own commands (dispatch_compute)
 void vk_full_barrier(VkCommandBuffer cb) {
     vtx_hazard = true;  // (begin_pass clears it after its own)
@@ -1040,13 +1225,6 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
 // the range it wrote: each copy keeps the update count it was made at and which written ranges it covers. (Copies used
 // to be shared within one GPU piece of ~300 draws and every UpdateUniformBuffer dropped them all: ~3000 copies, ~15 MB,
 // a frame in the open world.)
-#define GCOPY_TAB 4096
-#define UUB_MAX 64
-static struct { uint64_t addr, size, gen, serial, mask; int chunk; VkSpan span; } gcopy[GCOPY_TAB];
-static uint64_t gcopy_gen = 1;
-static struct { uint64_t lo, hi, serial; } uubt[UUB_MAX];  // ranges UpdateUniformBuffer wrote, with the last update's count
-static int nuub;
-static uint64_t uub_serial;
 static void guest_copy_flush(void) { __atomic_fetch_add(&gcopy_gen, 1, __ATOMIC_RELAXED); }
 
 // UpdateUniformBuffer wrote [lo, hi)
@@ -1188,45 +1366,6 @@ static void run_job(void (*fn)(void *), void *arg) {
 }
 
 // ================================================================== state
-typedef struct {
-    NvnTexture *color[8];
-    NvnTextureView cview[8];
-    uint8_t has_cview[8];
-    int ncolor;
-    NvnTexture *depth;
-    NvnTextureView dview;
-    uint8_t has_dview;
-} RtState;
-
-typedef struct { uint64_t addr, size; } Range;
-
-static struct {
-    RtState rt;
-    bool rt_dirty;
-    NvnProgram *program;
-    uint8_t blend[8][8];
-    uint32_t channel_mask;
-    uint8_t color_state[4], ds[8], ms[0x18], poly[4];
-    float poly_offset[3];
-    float line_width;
-    uint32_t attrib[16];
-    int nattrib;
-    uint32_t stream[16][2];
-    int nstream;
-    Range vbuf[16], ubuf[6][18], sbuf[6][16];
-    uint64_t tex[6][32], img[6][8];
-    NvnDescPool *tpool, *spool;
-    float viewport[16][4];
-    int32_t scissor[16][4];
-    float depth_range[16][2];
-    float blend_color[4];
-    uint32_t stencil_ref[2], stencil_mask[2], stencil_vmask[2];
-    bool prim_restart;
-    uint32_t restart_index;
-    bool depth_clamp;
-    bool rasterizer_discard;  // nvnCommandBufferSetRasterizerDiscard: draw() skips draws (no transform feedback here)
-    uint64_t copy_row_stride, copy_image_stride;
-} st;
 
 uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
@@ -1417,7 +1556,6 @@ bool renderer_texture_frame_fresh(NvnTexture *t);
 void renderer_texture_mark_presented(NvnTexture *t);
 uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
-static float pass_sx = 1, pass_sy = 1;
 static bool pass_out;  // the pass draws into the game's final image (RS_OUT: the HUD and menus draw there)
 static bool hud_clip;  // the draw in progress is a 16:9 layout's pane wholly off a 16:9 screen: not drawn (hud_patch)
 // Gameplay > HUD size this frame, 1: none. Only the HUD in play: not in menus, the title, a load or an event (a talk's text).
@@ -1473,15 +1611,9 @@ static bool hud_shop_pane(float x, float y) {
             if (fabsf(xy[f][2 * i] - x) < 0.01f && fabsf(xy[f][2 * i + 1] - y) < 0.01f) return true;
     return false;
 }
-static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
-static float tex_sc[2][64][2];
-static uint32_t tex_wh[2][64][2];
 
 // ================================================================== render passes
-static VkFormat pass_color[8], pass_depth, pass_stencil;
-static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 // (mvec.c) the motion target's slot in the current pass (-1: none), the frame it was last cleared in
-static int pass_mvec = -1;
 static uint64_t mvec_cleared = ~0ull;
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f);
 // A native-size background capture excludes the map cursor from refraction.
@@ -1528,7 +1660,6 @@ static int pass_dbg_n, pass_dbg_draws;
 // to a host buffer, and once that submission has completed (any wait on the GPU checks) the rows go to the texture's
 // storage with its stride.
 typedef struct { VkBuffer buf; VmaAllocation mem; const uint8_t *ptr; uint64_t seq, addr, stride, fs, serial; uint32_t row, rows, fmt; } Readback;
-static uint64_t g_cur_fs_hash;  // (the fragment shader of the draw in progress: defined with the draw code below)
 static Readback readbacks[64];
 static int nreadbacks;
 static pthread_mutex_t readback_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1537,10 +1668,6 @@ static pthread_mutex_t readback_lock = PTHREAD_MUTEX_INITIALIZER;
 // queue thread on the PS4 (radv_bo_create + radv_free_memory: ~1/3 of its waits).
 static struct { VkBuffer buf; VmaAllocation mem; const uint8_t *ptr; uint64_t size; } rb_free[16];
 static int nrb_free;
-static NvnTexture *pass_linear[8];  // the pass's linear color targets (begin_pass), with their views
-static NvnTextureView pass_linear_view[8];
-static bool pass_linear_has_view[8];
-static int pass_nlinear;
 
 // What guest memory held after the last copy back, per linear target, and which image (TexBackend serial) it matches:
 // a different hash later means the CPU wrote there, and the image takes those texels before the GPU draws into it
@@ -1768,6 +1895,7 @@ static void readback_schedule(VkCommandBuffer cb, NvnTexture *t, const NvnTextur
     r->fs = g_cur_fs_hash;
     r->serial = b->serial;
     nreadbacks++;
+    par_cut(PB_READBACK);
     {   // (GPU_OVERLAP) a target not read back within the last 16 frames (a photo; not the sky / exposure ones, read
         // every frame or in turns: 8 128x128 targets one after another): the wait on this submission is a real one,
         // so the game reads this frame's pixels. The 1x1 ones (light and exposure values) are waited for too: read a
@@ -1993,13 +2121,8 @@ static VkImageView depth_twin_sample(TexBackend *b, int textype, bool update) {
 // the others are left out. A draw that would write one of them ends the pass first (the next one has it attached and
 // the memory remembers it), so a wrong guess costs a pass, not a picture. Left out, a target the pass samples is read
 // as the texture it then is (no snapshot copy).
-#define DET_TAB 8192
-static struct { uint64_t key; uint8_t written; bool used; } det_tab[DET_TAB];
-static uint64_t pass_key;
-static uint8_t pass_detached;
 static bool det_no_next;  // (a clear begins this pass: everything attached)
 static uint8_t det_written;  // color slots the open pass drew into or cleared
-static uint8_t det_draw;     // (during resolve_feedback) the slots the draw's pass leaves out: not attachments then
 static uint64_t stat_det_miss;
 static bool pass_frag_only;      // the open pass began behind a fragment-only barrier (SAVAGEWIND_VK_BARRIER_FRAG)
 static bool pass_vs_reads_next;  // the pass about to begin has a draw whose vertex stage reads textures / memory
@@ -2382,7 +2505,7 @@ static void begin_pass(void) {
     if (pass_void) {
         in_pass = true;
         key_gen++;
-        stat_passes++;
+        stat_passes++, par.passes++;
         return;
     }
     pass_mvec = -1;
@@ -2409,7 +2532,7 @@ static void begin_pass(void) {
     in_pass = true;
     key_gen++;  // (the pass's formats are in the pipeline key)
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
-    stat_passes++;
+    stat_passes++, par.passes++;
 }
 
 static void pass_size(int *w, int *h) {
@@ -3684,11 +3807,11 @@ static void stage_layouts(StageBuild *b, int stage) {
 // alpha to coverage), into cache; lookup: only if cache has it (no compile)
 static VkPipeline gpl_shader_lib(VkShaderModule m, int stage, VkPipelineLayout layout, int variant, VkPipelineCache cache,
                                  bool lookup) {
-    VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+    VkPipelineShaderStageCreateInfo stage_ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                           .stage = stage == STAGE_VERTEX ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT,
                                           .module = m, .pName = "main", .pSpecializationInfo = vk_gather_spec()};
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    VkGraphicsPipelineCreateInfo pi = {.pNext = &ri, .stageCount = 1, .pStages = &st, .layout = layout,
+    VkGraphicsPipelineCreateInfo pi = {.pNext = &ri, .stageCount = 1, .pStages = &stage_ci, .layout = layout,
                                        .flags = lookup ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0};
     VkPipeline p;
     if (stage == STAGE_VERTEX) {
@@ -3788,11 +3911,11 @@ static VkPipeline gpl_state_lib(const PipeState *s, bool output) {
         uint32_t na = 0, nb = 0, nd = 0;
         for (int i = 0; i < 32; i++)
             if (k.attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k.attr_bind[i], k.attr_fmt[i], k.attr_off[i]};
-        for (uint32_t st = 0; st < 17; st++) {
-            if (!(k.used_streams & (1u << st))) continue;
-            bool inst = k.divisor[st] != 0;
-            vb[nb++] = (VkVertexInputBindingDescription){st, k.stride[st], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
-            if (inst && k.divisor[st] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){st, k.divisor[st]};
+        for (uint32_t sb = 0; sb < 17; sb++) {
+            if (!(k.used_streams & (1u << sb))) continue;
+            bool inst = k.divisor[sb] != 0;
+            vb[nb++] = (VkVertexInputBindingDescription){sb, k.stride[sb], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+            if (inst && k.divisor[sb] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){sb, k.divisor[sb]};
         }
         VkPipelineVertexInputDivisorStateCreateInfoEXT dvi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
                                                               .vertexBindingDivisorCount = nd, .pVertexBindingDivisors = vd};
@@ -3952,11 +4075,6 @@ static void build_pipeline(void *arg) {
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
-static NvnTexture *feedback_tex[4];
-static VkImageView feedback_view[4];
-static bool feedback_any_type[4];  // the view fits every lookup type (a restricted view of the image itself)
-static int nfeedback;
-static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
 static TexBackend *snap_be[8];  // (the image snap_tex had when the snapshot was taken: compared, never followed)
 static bool snap_ok[8];
@@ -4111,8 +4229,6 @@ static void debug_save_depth(TexBackend *b, const char *path) {
 // (debugging) SAVAGEWIND_FEEDBACK_DUMP=<frame>: the color targets that draws of that frame sampled while writing them,
 // raw (level 0, layer 0), once the targets change after them: build/fbdump_<n>_<w>x<h>_f<vkformat>.bin. Compares
 // the copies with the feedback loop pixel for pixel.
-static NvnTexture *fbrun_tex[4];
-static int nfbrun;
 static bool fbdump_on(void) {
     static long at = -2;
     if (at == -2) at = getenv("SAVAGEWIND_FEEDBACK_DUMP") ? atol(getenv("SAVAGEWIND_FEEDBACK_DUMP")) : -1;
@@ -4192,7 +4308,6 @@ static bool depth_read_only(void) {
 }
 
 static long logfb = -1, fbskip;  // (SAVAGEWIND_LOG_FEEDBACK)
-static unsigned fb_draws;
 static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
     draw_feedback = false;
@@ -4491,6 +4606,7 @@ static void resolve_feedback(Prog *pr) {
                 continue;
             }
             stat_feedback_copies++;
+            par_cut(PB_FEEDBACK);
             if (!is_depth) fbdump_note(t);
             // SAVAGEWIND_LOG_FEEDBACK=<n>: 200 snapshots after the first n (what is sampled while bound)
             if (logfb < 0) logfb = getenv("SAVAGEWIND_LOG_FEEDBACK") ? (fbskip = atol(getenv("SAVAGEWIND_LOG_FEEDBACK")), 200) : 0;
@@ -4554,7 +4670,6 @@ static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
 // c[4] words 212-213 = 1/896, four taps at +-0.5 texel). Left as is, the taps stay a console texel apart, several
 // texels of the bigger map: the penumbra breaks into steps. In draws that sample such a map, that pair in the
 // fragment stage's constant buffers becomes the map's own texel size (1/2048, 1/4096): the same filter, finer.
-static struct { uint32_t gw, gh; float s; } sdw_fix;  // (the draw in progress; s 0: it samples no bigger shadow map)
 
 static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float s; bool found; VkDescriptorBufferInfo d; } memo[8];
@@ -4605,7 +4720,6 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
 // gathered texture's own scale (its allocated size over the game's: each scaled size is rounded on its own), and a
 // fragment constant pair (1/w, 1/h) of the gathered texture's size becomes its allocated texel: the same choice in the
 // scaled image's texels. At the game's own size nothing changes. SAVAGEWIND_NO_UPSAMPLE_FIX=1: as before.
-static struct { uint32_t gw, gh; float sx, sy; uint32_t tw, th, aw, ah; } up_fix;  // (the draw in progress; sx 0: not such a draw)
 
 static bool up_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float sx, sy; bool found; VkDescriptorBufferInfo d; } memo[8];
@@ -8691,6 +8805,7 @@ have_pipe:
             rec_CmdResetQueryPool(vk_upload_cmd(), oq_pool, i, 1);
             rec_CmdBeginQuery(cb, oq_pool, i, g_vk.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
             oq_run[oq_nrun++] = i;
+            par_cut(PB_QUERY);
             oq = (int)i;
         }
     }
@@ -8699,8 +8814,10 @@ have_pipe:
     if (oq >= 0) rec_CmdEndQuery(cb, oq_pool, (uint32_t)oq);
     stat_draws++;
     draws_total++;
+    par_draws++;
     chunk_draws++;
     if (pr->vi->writes_gmem || pr->fi->writes_gmem) {
+        par_cut(PB_GMEM);
         bar_other = true;
         if (pr->vi->writes_gmem) gw_note(0);
         if (pr->fi->writes_gmem) gw_note(1);
@@ -10786,6 +10903,7 @@ static void lst_end(int depth) {
     if (lst[depth].uub) { lsum.uub_lists++; lsum.uub += lst[depth].uub; }
 }
 void vk_list_stats_frame(void) {  // (device.c, each present)
+    par_frame();
     if (lst_on <= 0) return;
     static int n;
     lst_nuub = 0;
@@ -10976,7 +11094,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
-        case CMD_CLEAR_COLOR: {
+        case CMD_CLEAR_COLOR: par.clears++; {
             snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
             if (ENV_ONCE("SAVAGEWIND_LOG_CLEARS") && index < st.rt.ncolor && st.rt.color[index])
@@ -10985,7 +11103,7 @@ static void exec_list(uint64_t handle, int depth) {
             if (index < st.rt.ncolor && st.rt.color[index]) clear(index, (int)r->x[5], x, (uint32_t)r->x[2], false, 0, false, 0, 0);
             break;
         }
-        case CMD_CLEAR_TEXTURE: {
+        case CMD_CLEAR_TEXTURE: par.clears++; {
             // ClearTexture(cmd, texture, view, region, color, mask): a render-target clear of the texture alone (renderer.m)
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
@@ -11010,14 +11128,14 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt_dirty = true;
             break;
         }
-        case CMD_CLEAR_DEPTH_STENCIL:
+        case CMD_CLEAR_DEPTH_STENCIL: par.clears++;
             snap_reason = "clear-depth"; snapshots_invalidate(NULL);
             if (st.rt.depth) {
                 bool has_stencil = renderer_format_has_stencil(st.rt.depth->format);
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_DISPATCH: par_cut(PB_DISPATCH); dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
@@ -11033,9 +11151,11 @@ static void exec_list(uint64_t handle, int depth) {
             uub_note(r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3]);  // (the shared copies over it are stale now)
             break;
         case CMD_BARRIER:
+            par.barriers++;
             if (logfb > 0 && !fbskip) LOG("[feedback] barrier %#llx after %u draws\n", (unsigned long long)r->x[0], fb_draws);
             break;
         case CMD_FENCE_SYNC: {
+            par.fences++;
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("SAVAGEWIND_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
@@ -11090,11 +11210,12 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_RESET_COUNTER:
             if (r->x[0] == 1) { oq_counting = true; oq_nrun = 0; }  // SAMPLES_PASSED
             break;
-        case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); break; }
-        case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
-        case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
-        case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_COPY_TEXTURE_TO_TEXTURE: par_cut(PB_COPY); { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); break; }
+        case CMD_DOWNSAMPLE: par_cut(PB_COPY); { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
+        case CMD_COPY_BUFFER_TO_TEXTURE: par_cut(PB_COPY); copy_buffer_to_texture(r->x[0], x); break;
+        case CMD_COPY_TEXTURE_TO_BUFFER: par_cut(PB_COPY); copy_texture_to_buffer(x, r->x[3]); break;
         case CMD_COPY_BUFFER_TO_BUFFER:
+            par_cut(PB_COPY);
             renderer_flush();
             kernel_watch_write("CopyBufferToBuffer", r->x[1], r->x[2]);
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);

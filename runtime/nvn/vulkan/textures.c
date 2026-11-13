@@ -475,6 +475,8 @@ static bool heart_half_texture(NvnTexture *t) {
 }
 
 static void create_image(NvnTexture *t, TexBackend *b) {
+    extern uint64_t g_par_images;  // (exec.c, SAVAGEWIND_VK_PAR_STATS)
+    g_par_images++;
     VkFmt mf = fmt_of(t->format);
     b->scalable = b->rs_group != RS_NONE;
     // (RS_SHADOW: the cascades' width, also for their half-size copy, so that both grow by the same factor)
