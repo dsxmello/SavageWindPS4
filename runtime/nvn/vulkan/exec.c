@@ -151,6 +151,26 @@ typedef struct Tx {
     } dc;
     uint64_t key_gen;
     uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
+    // Counters (the [vk] line, profiling): summed into the queue thread's context by tx_stats_gather
+    struct {
+        uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
+        uint64_t stat_links_now;  // pipelines linked on the render thread within the frame's budget (link_now)
+        uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+        uint64_t draws_total;  // (every draw since the start, never reset: vk_draw_total)
+        uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
+        uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
+        uint64_t stat_ubo_direct, stat_chain_barriers;  // constant buffers bound in place (ubo_direct)
+        uint64_t stat_feedback_live;  // depth attachments sampled as they are (read-only feedback, no copy)
+        uint64_t stat_feedback_loops, stat_feedback_barriers;  // draws sampling a target they write, in a feedback loop
+        uint64_t stat_upload_bytes;
+        uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
+        uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
+        uint64_t cum_xwait;  // (profiling) the part of cum_wait spent inside backend_execute
+        uint64_t stat_hash_sync, stat_hash_rb;
+        uint64_t stat_det_miss;
+        uint64_t stat_frag_barriers, stat_frag_restarts;
+        uint64_t stat_discarded;
+    } stats;
 } Tx;
 // Memory of a function's per-thread memos (txlocal), made on a thread's first use and kept: translating threads last.
 static void *tx_local_new(size_t n) {
@@ -160,7 +180,54 @@ static void *tx_local_new(size_t n) {
 }
 static Tx tx_main = {.bar_other = true, .vtx_hazard = true, .pass_sx = 1, .pass_sy = 1, .vp_sx = 1, .vp_sy = 1, .vp_ox = 0, .vp_oy = 0, .pass_samples = 1, .pass_mvec = -1, .gcopy_gen = 1, .dyn_epoch = 1, .key_gen = 1};
 static _Thread_local Tx *g_tx __attribute__((tls_model("initial-exec"))) = &tx_main;
+// Every translation context (tx_main first). Their counters go into tx_main's before they are read (renderer_stats,
+// at a present: no context is translating then).
+static Tx *tx_list[8] = {&tx_main};
+static int ntx_list = 1;
+static void tx_stats_gather(void) {
+    uint64_t *to = (uint64_t *)&tx_main.stats;
+    for (int k = 1; k < ntx_list; k++) {
+        uint64_t *from = (uint64_t *)&tx_list[k]->stats;
+        for (size_t i = 0; i < sizeof tx_main.stats / sizeof *to; i++) to[i] += from[i], from[i] = 0;
+    }
+}
 #define st (g_tx->st)
+#define stat_build_waits (g_tx->stats.stat_build_waits)
+#define stat_links_now (g_tx->stats.stat_links_now)
+#define stat_draws (g_tx->stats.stat_draws)
+#define stat_skipped (g_tx->stats.stat_skipped)
+#define stat_passes (g_tx->stats.stat_passes)
+#define stat_dispatches (g_tx->stats.stat_dispatches)
+#define stat_wait_ns (g_tx->stats.stat_wait_ns)
+#define stat_flushes (g_tx->stats.stat_flushes)
+#define stat_feedback_copies (g_tx->stats.stat_feedback_copies)
+#define draws_total (g_tx->stats.draws_total)
+#define stat_gw_waits (g_tx->stats.stat_gw_waits)
+#define stat_gw_holds (g_tx->stats.stat_gw_holds)
+#define stat_uub (g_tx->stats.stat_uub)
+#define stat_uub_same (g_tx->stats.stat_uub_same)
+#define stat_gcopy_hit (g_tx->stats.stat_gcopy_hit)
+#define stat_gcopy_miss (g_tx->stats.stat_gcopy_miss)
+#define stat_gcopy_bytes (g_tx->stats.stat_gcopy_bytes)
+#define stat_ubo_direct (g_tx->stats.stat_ubo_direct)
+#define stat_chain_barriers (g_tx->stats.stat_chain_barriers)
+#define stat_feedback_live (g_tx->stats.stat_feedback_live)
+#define stat_feedback_loops (g_tx->stats.stat_feedback_loops)
+#define stat_feedback_barriers (g_tx->stats.stat_feedback_barriers)
+#define stat_upload_bytes (g_tx->stats.stat_upload_bytes)
+#define stat_sets (g_tx->stats.stat_sets)
+#define stat_sets_reused (g_tx->stats.stat_sets_reused)
+#define cum_exec (g_tx->stats.cum_exec)
+#define cum_wait (g_tx->stats.cum_wait)
+#define cum_draws (g_tx->stats.cum_draws)
+#define cum_submits (g_tx->stats.cum_submits)
+#define cum_xwait (g_tx->stats.cum_xwait)
+#define stat_hash_sync (g_tx->stats.stat_hash_sync)
+#define stat_hash_rb (g_tx->stats.stat_hash_rb)
+#define stat_det_miss (g_tx->stats.stat_det_miss)
+#define stat_frag_barriers (g_tx->stats.stat_frag_barriers)
+#define stat_frag_restarts (g_tx->stats.stat_frag_restarts)
+#define stat_discarded (g_tx->stats.stat_discarded)
 #define dyn_epoch (g_tx->dyn_epoch)
 #define dc (g_tx->dc)
 #define key_gen (g_tx->key_gen)
@@ -216,10 +283,6 @@ static _Thread_local Tx *g_tx __attribute__((tls_model("initial-exec"))) = &tx_m
 #define uub_serial (g_tx->uub_serial)
 
 
-static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
-static uint64_t stat_links_now;    // pipelines linked on the render thread within the frame's budget (link_now)
-static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
-static uint64_t draws_total;  // (every draw since the start, never reset: vk_draw_total)
 
 // (measuring) SAVAGEWIND_VK_PAR_STATS=1: how a frame would split for translation on several threads. The frame is cut at
 // each operation that has to stay in order with the CPU or with what was translated before it (a feedback snapshot,
@@ -272,20 +335,13 @@ static void par_frame(void) {
 }
 
 uint64_t vk_draw_total(void) { return draws_total; }  // (device.c boot_held: how much the game draws a frame)
-static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
-static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
-static uint64_t stat_ubo_direct, stat_chain_barriers;  // constant buffers bound in place (ubo_direct)
 static void ubo_check_done(bool report);
 static void ubo_check_submit(uint64_t seq);
-static uint64_t stat_feedback_live;  // depth attachments sampled as they are (read-only feedback, no copy)
-static uint64_t stat_feedback_loops, stat_feedback_barriers;  // draws sampling a target they write, in a feedback loop
 static bool pass_ds_written;         // a draw of the current pass wrote depth or stencil
 static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
 static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since the pass began or its last feedback barrier
 static uint8_t pass_feedback;        // the color targets (bits) the current pass began with a feedback loop enabled
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
-static uint64_t stat_upload_bytes;
-static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
 static struct { NvnTexture *t; TexBackend *img; float sx, sy; } scene_up;
 static NvnTexture *scene_depth;
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
@@ -297,8 +353,6 @@ static uint64_t prof_index_direct, prof_index_copy, prof_vertex_direct, prof_ver
 static uint64_t prof_feedback_resolve, prof_scene_post, prof_snapshots, prof_gw_check, prof_begin_pass;
 static uint64_t prof_heap_range_checks, prof_heap_range_cached, prof_heap_range_check_ns;
 static VkQueryPool prof_qp;
-static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
-static uint64_t cum_xwait;  // (profiling) the part of cum_wait spent inside backend_execute
 static __thread bool in_execute;  // (this thread is in backend_execute)
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
@@ -310,7 +364,6 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 static int profd;
 #define PROFD_T0() uint64_t prof_t0_ = profd ? SDL_GetTicksNS() : 0
 #define PROFD_ADD(v) do { if (profd) v += SDL_GetTicksNS() - prof_t0_; } while (0)
-static uint64_t cum_draws;  // draws so far (vk_pso_wait_needed)
 // The profiler's draw-path timers (runtime/prof.h): stamps taken only while a capture runs, the time between two of them
 // added up per frame under a name ("/" nests it under the one before it in the report)
 #define PZ_NOW() (prof_enabled() ? prof_zone_begin(NULL) : (ProfZone){0})
@@ -1272,7 +1325,6 @@ static void uub_note(uint64_t lo, uint64_t hi) {
 
 // Bytes of guest memory hashed (the "hash" field): linear targets before a pass (linear_target_sync), after a copy back
 // lands (readbacks), and textures' full hashes (textures.c upload_texture)
-static uint64_t stat_hash_sync, stat_hash_rb;
 
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
@@ -1429,6 +1481,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
 }
 
 const char *renderer_stats(void) {
+    tx_stats_gather();
     static int dumps, always = -1;
     if (always < 0) always = getenv("SAVAGEWIND_LOG_CMD_COUNTS") != NULL;  // (debugging) every interval, not just the first 3
     if (dumps++ < 3 || always) {
@@ -2149,10 +2202,8 @@ static VkImageView depth_twin_sample(TexBackend *b, int textype, bool update) {
 // as the texture it then is (no snapshot copy).
 static bool det_no_next;  // (a clear begins this pass: everything attached)
 static uint8_t det_written;  // color slots the open pass drew into or cleared
-static uint64_t stat_det_miss;
 static bool pass_frag_only;      // the open pass began behind a fragment-only barrier (SAVAGEWIND_VK_BARRIER_FRAG)
 static bool pass_vs_reads_next;  // the pass about to begin has a draw whose vertex stage reads textures / memory
-static uint64_t stat_frag_barriers, stat_frag_restarts;
 static uint64_t pass_serial;  // passes begun
 static int det_on(void) {
     static int on = -1;
@@ -3331,7 +3382,17 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     return p;
 }
 
+// The program and pipeline tables are shared by the translating threads: looked up and filled under these locks (only
+// when a thread's memo misses: most draws repeat the last program and pipeline).
+static pthread_mutex_t prog_lock = PTHREAD_MUTEX_INITIALIZER, pipe_lock = PTHREAD_MUTEX_INITIALIZER;
+static Prog *get_program_locked(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
 static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
+    pthread_mutex_lock(&prog_lock);
+    Prog *p = get_program_locked(np, vkey, fkey);
+    pthread_mutex_unlock(&prog_lock);
+    return p;
+}
+static Prog *get_program_locked(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
     const uint8_t *vb = (const uint8_t *)vkey;  // (8 bytes a step)
@@ -8040,7 +8101,6 @@ static bool draw_must_happen(void) {
     return false;
 }
 static void draw_(CmdRec *r, bool indexed);
-static uint64_t stat_discarded;
 static void draw(CmdRec *r, bool indexed) {
     // Rasterizer discard: the primitives stop before rasterization, so nothing reaches the targets, depth, stencil or
     // occlusion queries. Its only output in NVN is transform feedback, which isn't implemented (cmdbuf.c), so the draw
@@ -8528,6 +8588,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!pp || memcmp(&pipe_memo.k, &k, sizeof k)) {
         uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
+        pthread_mutex_lock(&pipe_lock);
         if (!pipe_tab) pipe_tab_grow();
         uint32_t pslot = pipe_slot_of(ph, pipe_cap);
         while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (pipe_cap - 1);
@@ -8547,6 +8608,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (ready) { pp->pipe = ready; atomic_store(&pp->state, 1); atomic_fetch_add(&stat_warm, 1); }
             else if (sync_shaders() || !link_now(pp)) run_job(build_pipeline, pp);  // (asynchronous: a link alone is done here)
         }
+        pthread_mutex_unlock(&pipe_lock);
         pipe_memo.k = k;
         pipe_memo.pp = pp;
     }
