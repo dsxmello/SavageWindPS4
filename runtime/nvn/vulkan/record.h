@@ -32,6 +32,7 @@ void rec_wait_submitted(uint64_t seq);  // until the driver has submission seq (
 // Everything queued so far is recorded and submitted (the translating thread): before vkDeviceWaitIdle, before
 // recording into a command buffer directly (the menu's ImGui, frame generation), before using the queue outside it.
 void rec_drain(void);
+void rec_set_direct(bool on);  // (a translation worker) this thread records its own command buffers itself
 
 // ---- profiling (SAVAGEWIND_VK_PROF): counts since the last take
 typedef struct {

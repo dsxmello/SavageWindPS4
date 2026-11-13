@@ -172,6 +172,21 @@ typedef struct Tx {
         uint64_t stat_frag_barriers, stat_frag_restarts;
         uint64_t stat_discarded;
     } stats;
+    bool pass_ds_written;  // a draw of the current pass wrote depth or stencil
+    uint8_t pass_color_written;  // the color targets (bits) a draw of the current pass wrote
+    uint8_t pass_color_unsynced;  // the color targets drawn or cleared since the pass began or its last feedback barrier
+    uint8_t pass_feedback;  // the color targets (bits) the current pass began with a feedback loop enabled
+    bool draw_feedback;  // the current draw samples a target it writes (its pipeline allows the loop)
+    bool pass_void;  // the pass in progress has nothing to draw into: not begun, its draws and clears skipped (begin_pass)
+    bool after_dispatch;  // nothing recorded since the last dispatch but its own commands (dispatch_compute)
+    bool pass_out;  // the pass draws into the game's final image (RS_OUT: the HUD and menus draw there)
+    bool hud_clip;  // the draw in progress is a 16:9 layout's pane wholly off a 16:9 screen: not drawn (hud_patch)
+    TexBackend *pass_twin;  // (the pass in progress draws into the shadow copy: its twin made again after it)
+    bool det_no_next;  // (a clear begins this pass: everything attached)
+    uint8_t det_written;  // color slots the open pass drew into or cleared
+    bool pass_frag_only;  // the open pass began behind a fragment-only barrier (SAVAGEWIND_VK_BARRIER_FRAG)
+    bool pass_vs_reads_next;  // the pass about to begin has a draw whose vertex stage reads textures / memory
+    bool fxaa_off;  // (the draw in progress)
 } Tx;
 // Memory of a function's per-thread memos (txlocal), made on a thread's first use and kept: translating threads last.
 static void *tx_local_new(size_t n) {
@@ -193,6 +208,21 @@ static void tx_stats_gather(void) {
     }
 }
 #define st (g_tx->st)
+#define pass_ds_written (g_tx->pass_ds_written)
+#define pass_color_written (g_tx->pass_color_written)
+#define pass_color_unsynced (g_tx->pass_color_unsynced)
+#define pass_feedback (g_tx->pass_feedback)
+#define draw_feedback (g_tx->draw_feedback)
+#define pass_void (g_tx->pass_void)
+#define after_dispatch (g_tx->after_dispatch)
+#define pass_out (g_tx->pass_out)
+#define hud_clip (g_tx->hud_clip)
+#define pass_twin (g_tx->pass_twin)
+#define det_no_next (g_tx->det_no_next)
+#define det_written (g_tx->det_written)
+#define pass_frag_only (g_tx->pass_frag_only)
+#define pass_vs_reads_next (g_tx->pass_vs_reads_next)
+#define fxaa_off (g_tx->fxaa_off)
 #define stat_build_waits (g_tx->stats.stat_build_waits)
 #define stat_links_now (g_tx->stats.stat_links_now)
 #define stat_draws (g_tx->stats.stat_draws)
@@ -338,11 +368,6 @@ static void par_frame(void) {
 uint64_t vk_draw_total(void) { return draws_total; }  // (device.c boot_held: how much the game draws a frame)
 static void ubo_check_done(bool report);
 static void ubo_check_submit(uint64_t seq);
-static bool pass_ds_written;         // a draw of the current pass wrote depth or stencil
-static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
-static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since the pass began or its last feedback barrier
-static uint8_t pass_feedback;        // the color targets (bits) the current pass began with a feedback loop enabled
-static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static struct { NvnTexture *t; TexBackend *img; float sx, sy; } scene_up;
 static NvnTexture *scene_depth;
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
@@ -411,8 +436,19 @@ typedef struct {
     VkDescriptorPool pools[64];  // (BOTW 1.8.2 records thousands of draws into one submission)
     int npools, cur_pool;
 } Sub;
-static Sub subs[SUBS];
-static int cur_sub;
+// The submission slots this context records into, and the draws since its last submission (translation context, see Tx)
+typedef struct TxSub {
+    Sub subs[SUBS];
+    int cur_sub;
+    uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
+    bool chunk_hold;  // a shader that stores to guest memory was recorded since the last submission
+} TxSub;
+static TxSub txsub_main;
+static _Thread_local TxSub *g_txsub __attribute__((tls_model("initial-exec"))) = &txsub_main;
+#define subs (g_txsub->subs)
+#define cur_sub (g_txsub->cur_sub)
+#define chunk_draws (g_txsub->chunk_draws)
+#define chunk_hold (g_txsub->chunk_hold)
 static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static VkSemaphore gmem_sparse_timeline;
@@ -420,9 +456,6 @@ static uint64_t gmem_sparse_bind_seq;
 static uint64_t deferred_seq;  // (seq_lock; renderer_wait_seq, GPU_OVERLAP) a fence the game was told is done whose
                                // submission wasn't waited for
 static uint64_t oneshot_seq;   // (seq_lock) the latest submission with a one-off readback: a wait on it is never deferred
-static bool pass_void;  // the pass in progress has nothing to draw into: not begun, its draws and clears skipped (begin_pass)
-static uint32_t chunk_draws;  // draws and dispatches recorded since the last submission
-static bool chunk_hold;       // a shader that stores to guest memory was recorded since the last submission
 
 static pthread_mutex_t gpu_mutex;
 static pthread_once_t gpu_mutex_once = PTHREAD_ONCE_INIT;
@@ -560,7 +593,6 @@ void vk_pass_barrier_forget(void) { bar_other = true; }
 // Pass barriers (begin_pass, SAVAGEWIND_VK_BARRIER_FRAG): GPU work outside passes (copies, dispatches, clears; each
 // preceded by a full barrier, below) or a draw that stores to memory may have written what a later pass's vertex stage
 // reads (vertex data, instance data a compute shader culled): the next pass begins behind a full barrier then.
-static bool after_dispatch;  // nothing recorded since the last dispatch but its own commands (dispatch_compute)
 void vk_full_barrier(VkCommandBuffer cb) {
     vtx_hazard = true;  // (begin_pass clears it after its own)
     after_dispatch = false;
@@ -1190,8 +1222,16 @@ static VkDescriptorSet vk_alloc_set_one(VkDescriptorSetLayout layout, int count,
 // submission that allocated from it has completed.
 #define CHUNK_SIZE (64ull << 20)
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq; } Chunk;
-static Chunk *chunks;
-static int nchunks, active = -1;
+// The transient memory this context allocates from (the ring of chunks) (translation context, see Tx)
+typedef struct TxMem {
+    Chunk *chunks;
+    int nchunks, active;
+} TxMem;
+static TxMem txmem_main = {.active = -1};
+static _Thread_local TxMem *g_txmem __attribute__((tls_model("initial-exec"))) = &txmem_main;
+#define chunks (g_txmem->chunks)
+#define nchunks (g_txmem->nchunks)
+#define active (g_txmem->active)
 
 static int new_chunk(uint64_t size) {
     chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
@@ -1636,8 +1676,6 @@ bool renderer_texture_frame_fresh(NvnTexture *t);
 void renderer_texture_mark_presented(NvnTexture *t);
 uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
-static bool pass_out;  // the pass draws into the game's final image (RS_OUT: the HUD and menus draw there)
-static bool hud_clip;  // the draw in progress is a 16:9 layout's pane wholly off a 16:9 screen: not drawn (hud_patch)
 // Gameplay > HUD size this frame, 1: none. Only the HUD in play: not in menus, the title, a load or an event (a talk's text).
 #define HUD_QUICK_HOLD_NS 500000000ull  // (a quick menu's bar fades out after the pause state ends)
 static bool hud_quick;  // a quick menu's bar may be on screen: it keeps the game's size (hud_quick_keeps)
@@ -2179,7 +2217,6 @@ static DepthTwin *depth_twin_update(VkCommandBuffer cb, TexBackend *b) {
     return t;
 }
 
-static TexBackend *pass_twin;  // (the pass in progress draws into the shadow copy: its twin made again after it)
 static void depth_twin_after_pass(VkCommandBuffer cb) {
     if (pass_twin) depth_twin_update(cb, pass_twin);
     pass_twin = NULL;
@@ -2201,10 +2238,6 @@ static VkImageView depth_twin_sample(TexBackend *b, int textype, bool update) {
 // the others are left out. A draw that would write one of them ends the pass first (the next one has it attached and
 // the memory remembers it), so a wrong guess costs a pass, not a picture. Left out, a target the pass samples is read
 // as the texture it then is (no snapshot copy).
-static bool det_no_next;  // (a clear begins this pass: everything attached)
-static uint8_t det_written;  // color slots the open pass drew into or cleared
-static bool pass_frag_only;      // the open pass began behind a fragment-only barrier (SAVAGEWIND_VK_BARRIER_FRAG)
-static bool pass_vs_reads_next;  // the pass about to begin has a draw whose vertex stage reads textures / memory
 static uint64_t pass_serial;  // passes begun
 static int det_on(void) {
     static int on = -1;
@@ -5153,7 +5186,6 @@ static bool fxaa_shader(uint64_t fs_hash) {
     return fs_hash == 0x058188a1db3e22e9ull  // in play: console FXAA
         || fs_hash == 0x0a849327680eee9full; // the pause menu: quality FXAA
 }
-static bool fxaa_off;  // (the draw in progress)
 // fxaa_patch's memos, one set per translating thread (txlocal)
 struct L_fxaa_patch {
     float buf[0x10000 / 4];
@@ -5498,7 +5530,7 @@ static bool gmem_sparse_refresh(uint64_t size) {
     uint64_t chunk_count = (page_count + GMEM_SPARSE_CHUNK_PAGES - 1) / GMEM_SPARSE_CHUNK_PAGES;
     uint64_t run_start = UINT64_MAX;
     for (uint64_t chunk = 0; chunk <= chunk_count; chunk++) {
-        bool active = false;
+        bool committed_run = false;
         if (chunk < chunk_count) {
             uint64_t first_page = chunk * GMEM_SPARSE_CHUNK_PAGES;
             uint64_t end_page = first_page + GMEM_SPARSE_CHUNK_PAGES;
@@ -5506,18 +5538,18 @@ static bool gmem_sparse_refresh(uint64_t size) {
             if (!gmem_sparse_bound_pages[first_page]) {
                 uint64_t first_word = first_page / 64;
                 uint64_t end_word = (end_page + 63) / 64;
-                for (uint64_t word = first_word; word < end_word && !active; word++) {
+                for (uint64_t word = first_word; word < end_word && !committed_run; word++) {
                     uint64_t committed = plat_guest_sparse_heap_committed_word(word);
                     uint64_t word_first_page = word * 64;
                     uint64_t lo = first_page > word_first_page ? first_page - word_first_page : 0;
                     uint64_t hi = end_page < word_first_page + 64 ? end_page - word_first_page : 64;
                     uint64_t mask = (hi == 64 ? UINT64_MAX : (1ull << hi) - 1) & ~((1ull << lo) - 1);
-                    active = (committed & mask) != 0;
+                    committed_run = (committed & mask) != 0;
                 }
             }
         }
-        if (active && run_start == UINT64_MAX) run_start = chunk;
-        if (!active && run_start != UINT64_MAX) {
+        if (committed_run && run_start == UINT64_MAX) run_start = chunk;
+        if (!committed_run && run_start != UINT64_MAX) {
             if (gmem_sparse_nmem >= GMEM_SPARSE_MEM_COUNT) {
                 LOG("[vk] sparse guest heap memory tracking overflow\n");
                 goto fail;

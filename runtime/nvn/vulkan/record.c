@@ -153,6 +153,11 @@ static void commit(void) {
     if (wpos - published >= publish_every) publish();
 }
 // (the arrays of a packet: after its arguments, 16-aligned)
+// A thread that records its own command buffers (a translation worker: exec.c) makes the calls itself instead of
+// queueing packets for the recorder: the ring has one producer. Submissions, drains and waits stay the queue thread's.
+static _Thread_local bool t_direct __attribute__((tls_model("initial-exec")));
+void rec_set_direct(bool on_) { t_direct = on_; }
+#define REC_DIRECT() (on <= 0 || t_direct)
 #define AL16(n) (((n) + 15) & ~(size_t)15)
 static inline void *after(const void *args, size_t args_size) { return (uint8_t *)args + AL16(args_size); }
 
@@ -351,7 +356,7 @@ static void update_sets_run(const void *p) {
     vkUpdateDescriptorSets(g_vk.dev, a->n, w, 0, NULL);
 }
 void rec_UpdateDescriptorSets(uint32_t n, const VkWriteDescriptorSet *w) {
-    if (on <= 0) { vkUpdateDescriptorSets(g_vk.dev, n, w, 0, NULL); return; }
+    if (REC_DIRECT()) { vkUpdateDescriptorSets(g_vk.dev, n, w, 0, NULL); return; }
     ENQ_T0();
     UpdateArgs *a = push(update_sets_run, sizeof *a, AL16(n * sizeof *w) + n * sizeof(WriteInfo));
     a->n = n;
@@ -375,7 +380,7 @@ static void begin_cb_run(const void *p) {
     VK_CHECK(vkBeginCommandBuffer(*(const VkCommandBuffer *)p, &bi));
 }
 void rec_BeginCommandBuffer(VkCommandBuffer cb) {
-    if (on <= 0) { begin_cb_run(&cb); return; }
+    if (REC_DIRECT()) { begin_cb_run(&cb); return; }
     ENQ_T0();
     *(VkCommandBuffer *)push(begin_cb_run, sizeof cb, 0) = cb;
     commit();
@@ -383,7 +388,7 @@ void rec_BeginCommandBuffer(VkCommandBuffer cb) {
 }
 static void end_cb_run(const void *p) { VK_CHECK(vkEndCommandBuffer(*(const VkCommandBuffer *)p)); }
 void rec_EndCommandBuffer(VkCommandBuffer cb) {
-    if (on <= 0) { end_cb_run(&cb); return; }
+    if (REC_DIRECT()) { end_cb_run(&cb); return; }
     ENQ_T0();
     *(VkCommandBuffer *)push(end_cb_run, sizeof cb, 0) = cb;
     commit();
@@ -434,7 +439,7 @@ typedef struct { void (*fn)(void *); void *arg; } CustomArgs;
 static void custom_run(const void *p) { const CustomArgs *a = p; a->fn(a->arg); }
 void rec_custom(void (*fn)(void *), void *arg) {
     CustomArgs a = {fn, arg};
-    if (on <= 0) { custom_run(&a); return; }
+    if (REC_DIRECT()) { custom_run(&a); return; }
     ENQ_T0();
     *(CustomArgs *)push(custom_run, sizeof a, 0) = a;
     publish();
@@ -445,7 +450,7 @@ void rec_custom(void (*fn)(void *), void *arg) {
 // Scalar arguments: a struct of the command buffer and the values, made by a macro from the parameter list.
 #define CMD_ARGS(name, ...) typedef struct { VkCommandBuffer cb; __VA_ARGS__ } name##Args;
 #define CMD_QUEUE(name, ...) \
-    do { if (on <= 0) { vk##name(__VA_ARGS__); return; } ENQ_T0(); name##Args *a_ = push(name##_run, sizeof *a_, 0); \
+    do { if (REC_DIRECT()) { vk##name(__VA_ARGS__); return; } ENQ_T0(); name##Args *a_ = push(name##_run, sizeof *a_, 0); \
          *a_ = (name##Args){__VA_ARGS__}; commit(); ENQ_END(); } while (0)
 
 CMD_ARGS(CmdDispatch, uint32_t x, y, z;)
@@ -478,7 +483,7 @@ void rec_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, 
 CMD_ARGS(CmdEndRendering, char pad_;)
 static void CmdEndRendering_run(const void *p) { vkCmdEndRendering(((const CmdEndRenderingArgs *)p)->cb); }
 void rec_CmdEndRendering(VkCommandBuffer cb) {
-    if (on <= 0) { vkCmdEndRendering(cb); return; }
+    if (REC_DIRECT()) { vkCmdEndRendering(cb); return; }
     ENQ_T0();
     ((CmdEndRenderingArgs *)push(CmdEndRendering_run, sizeof(CmdEndRenderingArgs), 0))->cb = cb;
     commit();
@@ -543,7 +548,7 @@ static void set_checkpoint(VkCommandBuffer cb, const void *marker) {
 CMD_ARGS(CmdSetCheckpointNV, const void *marker;)
 static void CmdSetCheckpointNV_run(const void *p) { const CmdSetCheckpointNVArgs *a = p; set_checkpoint(a->cb, a->marker); }
 void rec_CmdSetCheckpointNV(VkCommandBuffer cb, const void *marker) {
-    if (on <= 0) { set_checkpoint(cb, marker); return; }
+    if (REC_DIRECT()) { set_checkpoint(cb, marker); return; }
     ENQ_T0();
     CmdSetCheckpointNVArgs *a_ = push(CmdSetCheckpointNV_run, sizeof *a_, 0);
     *a_ = (CmdSetCheckpointNVArgs){cb, marker};
@@ -564,7 +569,7 @@ void rec_CmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query) { CMD
 CMD_ARGS(CmdSetBlendConstants, float c[4];)
 static void CmdSetBlendConstants_run(const void *p) { const CmdSetBlendConstantsArgs *a = p; vkCmdSetBlendConstants(a->cb, a->c); }
 void rec_CmdSetBlendConstants(VkCommandBuffer cb, const float c[4]) {
-    if (on <= 0) { vkCmdSetBlendConstants(cb, c); return; }
+    if (REC_DIRECT()) { vkCmdSetBlendConstants(cb, c); return; }
     ENQ_T0();
     CmdSetBlendConstantsArgs *a = push(CmdSetBlendConstants_run, sizeof *a, 0);
     a->cb = cb;
@@ -582,7 +587,7 @@ static void CmdBindVertexBuffers_run(const void *p) {
     vkCmdBindVertexBuffers(a->cb, a->first, a->n, b, o);
 }
 void rec_CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *bufs, const VkDeviceSize *offs) {
-    if (on <= 0) { vkCmdBindVertexBuffers(cb, first, n, bufs, offs); return; }
+    if (REC_DIRECT()) { vkCmdBindVertexBuffers(cb, first, n, bufs, offs); return; }
     ENQ_T0();
     CmdBindVertexBuffersArgs *a = push(CmdBindVertexBuffers_run, sizeof *a, AL16(n * sizeof *bufs) + n * sizeof *offs);
     *a = (CmdBindVertexBuffersArgs){cb, first, n};
@@ -602,7 +607,7 @@ static void CmdBindDescriptorSets_run(const void *p) {
 }
 void rec_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t first, uint32_t n,
                                const VkDescriptorSet *sets, uint32_t ndyn, const uint32_t *dyn) {
-    if (on <= 0) { vkCmdBindDescriptorSets(cb, bp, layout, first, n, sets, ndyn, dyn); return; }
+    if (REC_DIRECT()) { vkCmdBindDescriptorSets(cb, bp, layout, first, n, sets, ndyn, dyn); return; }
     ENQ_T0();
     CmdBindDescriptorSetsArgs *a = push(CmdBindDescriptorSets_run, sizeof *a, AL16(n * sizeof *sets) + ndyn * sizeof *dyn);
     *a = (CmdBindDescriptorSetsArgs){cb, bp, layout, first, n, ndyn};
@@ -619,7 +624,7 @@ static void CmdPushConstants_run(const void *p) {
     vkCmdPushConstants(a->cb, a->layout, a->stages, a->off, a->size, after(a, sizeof *a));
 }
 void rec_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t off, uint32_t size, const void *data) {
-    if (on <= 0) { vkCmdPushConstants(cb, layout, stages, off, size, data); return; }
+    if (REC_DIRECT()) { vkCmdPushConstants(cb, layout, stages, off, size, data); return; }
     ENQ_T0();
     CmdPushConstantsArgs *a = push(CmdPushConstants_run, sizeof *a, size);
     *a = (CmdPushConstantsArgs){cb, layout, stages, off, size};
@@ -631,7 +636,7 @@ void rec_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderS
 CMD_ARGS(CmdSetViewport, uint32_t first, n;)  // then VkViewport[n]
 static void CmdSetViewport_run(const void *p) { const CmdSetViewportArgs *a = p; vkCmdSetViewport(a->cb, a->first, a->n, after(a, sizeof *a)); }
 void rec_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport *v) {
-    if (on <= 0) { vkCmdSetViewport(cb, first, n, v); return; }
+    if (REC_DIRECT()) { vkCmdSetViewport(cb, first, n, v); return; }
     ENQ_T0();
     CmdSetViewportArgs *a = push(CmdSetViewport_run, sizeof *a, n * sizeof *v);
     *a = (CmdSetViewportArgs){cb, first, n};
@@ -642,7 +647,7 @@ void rec_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const Vk
 CMD_ARGS(CmdSetScissor, uint32_t first, n;)  // then VkRect2D[n]
 static void CmdSetScissor_run(const void *p) { const CmdSetScissorArgs *a = p; vkCmdSetScissor(a->cb, a->first, a->n, after(a, sizeof *a)); }
 void rec_CmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D *r) {
-    if (on <= 0) { vkCmdSetScissor(cb, first, n, r); return; }
+    if (REC_DIRECT()) { vkCmdSetScissor(cb, first, n, r); return; }
     ENQ_T0();
     CmdSetScissorArgs *a = push(CmdSetScissor_run, sizeof *a, n * sizeof *r);
     *a = (CmdSetScissorArgs){cb, first, n};
@@ -658,7 +663,7 @@ static void CmdClearAttachments_run(const void *p) {
     vkCmdClearAttachments(a->cb, a->na, at, a->nr, after(at, a->na * sizeof *at));
 }
 void rec_CmdClearAttachments(VkCommandBuffer cb, uint32_t na, const VkClearAttachment *at, uint32_t nr, const VkClearRect *r) {
-    if (on <= 0) { vkCmdClearAttachments(cb, na, at, nr, r); return; }
+    if (REC_DIRECT()) { vkCmdClearAttachments(cb, na, at, nr, r); return; }
     ENQ_T0();
     CmdClearAttachmentsArgs *a = push(CmdClearAttachments_run, sizeof *a, AL16(na * sizeof *at) + nr * sizeof *r);
     *a = (CmdClearAttachmentsArgs){cb, na, nr};
@@ -719,43 +724,43 @@ static void xfer(PktFn fn, const XferArgs *x, const void *regions, size_t size) 
     ENQ_END();
 }
 void rec_CmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst, uint32_t n, const VkBufferCopy *r) {
-    if (on <= 0) { vkCmdCopyBuffer(cb, src, dst, n, r); return; }
+    if (REC_DIRECT()) { vkCmdCopyBuffer(cb, src, dst, n, r); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)src, .h2 = (uint64_t)dst, .n = n};
     xfer(copy_buffer_run, &x, r, sizeof *r);
 }
 void rec_CmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r) {
-    if (on <= 0) { vkCmdCopyImage(cb, src, sl, dst, dl, n, r); return; }
+    if (REC_DIRECT()) { vkCmdCopyImage(cb, src, sl, dst, dl, n, r); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)src, .h2 = (uint64_t)dst, .l1 = sl, .l2 = dl, .n = n};
     xfer(copy_image_run, &x, r, sizeof *r);
 }
 void rec_CmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter f) {
-    if (on <= 0) { vkCmdBlitImage(cb, src, sl, dst, dl, n, r, f); return; }
+    if (REC_DIRECT()) { vkCmdBlitImage(cb, src, sl, dst, dl, n, r, f); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)src, .h2 = (uint64_t)dst, .l1 = sl, .l2 = dl, .n = n, .filter = f};
     xfer(blit_image_run, &x, r, sizeof *r);
 }
 void rec_CmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageResolve *r) {
-    if (on <= 0) { vkCmdResolveImage(cb, src, sl, dst, dl, n, r); return; }
+    if (REC_DIRECT()) { vkCmdResolveImage(cb, src, sl, dst, dl, n, r); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)src, .h2 = (uint64_t)dst, .l1 = sl, .l2 = dl, .n = n};
     xfer(resolve_image_run, &x, r, sizeof *r);
 }
 void rec_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout dl, uint32_t n, const VkBufferImageCopy *r) {
-    if (on <= 0) { vkCmdCopyBufferToImage(cb, src, dst, dl, n, r); return; }
+    if (REC_DIRECT()) { vkCmdCopyBufferToImage(cb, src, dst, dl, n, r); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)src, .h2 = (uint64_t)dst, .l2 = dl, .n = n};
     xfer(buffer_to_image_run, &x, r, sizeof *r);
 }
 void rec_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkBuffer dst, uint32_t n, const VkBufferImageCopy *r) {
-    if (on <= 0) { vkCmdCopyImageToBuffer(cb, src, sl, dst, n, r); return; }
+    if (REC_DIRECT()) { vkCmdCopyImageToBuffer(cb, src, sl, dst, n, r); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)src, .h2 = (uint64_t)dst, .l1 = sl, .n = n};
     xfer(image_to_buffer_run, &x, r, sizeof *r);
 }
 void rec_CmdClearColorImage(VkCommandBuffer cb, VkImage img, VkImageLayout l, const VkClearColorValue *c, uint32_t n, const VkImageSubresourceRange *rg) {
-    if (on <= 0) { vkCmdClearColorImage(cb, img, l, c, n, rg); return; }
+    if (REC_DIRECT()) { vkCmdClearColorImage(cb, img, l, c, n, rg); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)img, .l1 = l, .n = n, .clear.color = *c};
     xfer(clear_color_run, &x, rg, sizeof *rg);
 }
 void rec_CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage img, VkImageLayout l, const VkClearDepthStencilValue *c, uint32_t n,
                                    const VkImageSubresourceRange *rg) {
-    if (on <= 0) { vkCmdClearDepthStencilImage(cb, img, l, c, n, rg); return; }
+    if (REC_DIRECT()) { vkCmdClearDepthStencilImage(cb, img, l, c, n, rg); return; }
     XferArgs x = {.cb = cb, .h1 = (uint64_t)img, .l1 = l, .n = n, .clear.ds = *c};
     xfer(clear_ds_run, &x, rg, sizeof *rg);
 }
@@ -774,7 +779,7 @@ static void CmdPipelineBarrier2_run(const void *p) {
     vkCmdPipelineBarrier2(a->cb, &di);
 }
 void rec_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *di) {
-    if (on <= 0) { vkCmdPipelineBarrier2(cb, di); return; }
+    if (REC_DIRECT()) { vkCmdPipelineBarrier2(cb, di); return; }
     if (di->pNext) FATAL("[vk] recorder: a chained dependency\n");
     for (uint32_t i = 0; i < di->memoryBarrierCount; i++) if (di->pMemoryBarriers[i].pNext) FATAL("[vk] recorder: a chained barrier\n");
     for (uint32_t i = 0; i < di->bufferMemoryBarrierCount; i++) if (di->pBufferMemoryBarriers[i].pNext) FATAL("[vk] recorder: a chained barrier\n");
@@ -854,7 +859,7 @@ static void CmdBeginRendering_run(const void *p) {
     begin_rendering(a->cb, &ri);
 }
 void rec_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) {
-    if (on <= 0) { begin_rendering(cb, ri); return; }
+    if (REC_DIRECT()) { begin_rendering(cb, ri); return; }
     if (ri->pNext) FATAL("[vk] recorder: a chained rendering info\n");
     if (ri->colorAttachmentCount > 16) FATAL("[vk] recorder: %u colour attachments\n", ri->colorAttachmentCount);
     uint16_t fbl = 0;
