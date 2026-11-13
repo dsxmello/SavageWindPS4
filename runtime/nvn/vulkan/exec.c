@@ -1072,10 +1072,11 @@ static VkDescriptorSet vk_alloc_set_one(VkDescriptorSetLayout layout, int count,
 struct L_vk_alloc_set {
     struct { VkDescriptorSetLayout layout; Sub *s; uint64_t seq; int pool, n, next; VkDescriptorSet set[ASET_BATCH]; } cache[ASET_CACHE];
 };
-#define cache (L_->cache)
+#define cache (Lp->cache)
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
     static _Thread_local struct L_vk_alloc_set *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_vk_alloc_set *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     Sub *s = sub();
     uint32_t h = (uint32_t)(((uintptr_t)layout >> 4) * 2654435761u) >> 28;  // (16 entries)
     __typeof__(cache[0]) *c = &cache[h];
@@ -1225,10 +1226,11 @@ enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F
 struct L_copy_dedupe_in {
     struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
 };
-#define last (L_->last)
+#define last (Lp->last)
 static VkSpan copy_dedupe_in(int slot, const void *data, uint64_t size, uint64_t alloc, uint64_t align) {
     static _Thread_local struct L_copy_dedupe_in *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_copy_dedupe_in *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     uint64_t seq = vk_pending_seq();
     if (size > sizeof last[0].data) return vk_transient_copy(data, size, align);
     if (last[slot].seq == seq && last[slot].size == size && !memcmp(last[slot].data, data, size)) return last[slot].span;
@@ -2654,10 +2656,11 @@ static VkRect2D scissor_rect(void) {
 struct L_apply_scissor {
     struct { const void *c, *d; uint32_t w, h; float s[6]; int32_t sc[4]; VkRect2D r; bool ok; } m;
 };
-#define m (L_->m)
+#define m (Lp->m)
 static void apply_scissor(void) {
     static _Thread_local struct L_apply_scissor *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_apply_scissor *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     // (passes outside the final image: the rectangle depends on nothing else than these, the same for most of a pass's
     // draws; scissor_rect was ~2 % of the render thread)
     VkRect2D r;
@@ -4719,11 +4722,12 @@ struct L_sdw_patch {
     struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float s; bool found; VkDescriptorBufferInfo d; } memo[8];
     float buf[0x10000 / 4];
 };
-#define memo (L_->memo)
-#define buf (L_->buf)
+#define memo (Lp->memo)
+#define buf (Lp->buf)
 static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static _Thread_local struct L_sdw_patch *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_sdw_patch *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
     if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
@@ -4778,11 +4782,12 @@ struct L_up_patch {
     struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float sx, sy; bool found; VkDescriptorBufferInfo d; } memo[8];
     float buf[0x10000 / 4];
 };
-#define memo (L_->memo)
-#define buf (L_->buf)
+#define memo (Lp->memo)
+#define buf (Lp->buf)
 static bool up_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static _Thread_local struct L_up_patch *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_up_patch *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
     if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
@@ -4826,11 +4831,12 @@ struct L_up_patch_frag {
     struct { uint64_t addr, size, gen, serial, seq; uint32_t tw, th, aw, ah; bool found; VkDescriptorBufferInfo d; } memo[8];
     float buf[0x10000 / 4];
 };
-#define memo (L_->memo)
-#define buf (L_->buf)
+#define memo (Lp->memo)
+#define buf (Lp->buf)
 static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static _Thread_local struct L_up_patch_frag *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_up_patch_frag *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
     if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
@@ -4911,10 +4917,11 @@ static bool hud_frame_end(const float *g, const float *mv, const float *rc, floa
 struct L_hud_patch {
     float buf[0x10000 / 4];
 };
-#define buf (L_->buf)
+#define buf (Lp->buf)
 static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static _Thread_local struct L_hud_patch *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_hud_patch *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
     extern float output_view_shape(void);
@@ -5074,10 +5081,11 @@ static bool fxaa_off;  // (the draw in progress)
 struct L_fxaa_patch {
     float buf[0x10000 / 4];
 };
-#define buf (L_->buf)
+#define buf (Lp->buf)
 static bool fxaa_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static _Thread_local struct L_fxaa_patch *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_fxaa_patch *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     if (size < 0x40) return false;
     uint64_t n = size > sizeof buf ? sizeof buf : size;
     memcpy(buf, (const void *)(uintptr_t)addr, n);
@@ -5903,10 +5911,11 @@ static uint32_t gw_gen = 1;
 struct L_gw_overlaps {
     struct { uint64_t lo, hi; uint32_t gen; bool r; } memo[1024];
 };
-#define memo (L_->memo)
+#define memo (Lp->memo)
 static bool gw_overlaps(uint64_t lo, uint64_t hi) {
     static _Thread_local struct L_gw_overlaps *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_gw_overlaps *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     if (!ngw || hi <= gw_lo || lo >= gw_hi) return false;
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_VK_NO_GW_MEMO") == NULL;
@@ -6654,10 +6663,11 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
 struct L_texture_info {
     struct { uint64_t h, frame; const void *tpool, *spool, *tex; NvnTextureView view; uint8_t has_view; uint32_t gen; uint8_t type, stage, blend, valid; float bias, sc[2]; uint32_t wh[2]; VkDescriptorImageInfo ii; } m[2048];
 };
-#define m (L_->m)
+#define m (Lp->m)
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     static _Thread_local struct L_texture_info *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_texture_info *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
@@ -6696,10 +6706,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 struct L_texture_info_ {
     struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
 };
-#define memo (L_->memo)
+#define memo (Lp->memo)
 static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     static _Thread_local struct L_texture_info_ *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_texture_info_ *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
@@ -7002,13 +7013,14 @@ struct L_gsnap_info {
     VkDescriptorBufferInfo ebi;
 };
 static const struct L_gsnap_info L_gsnap_info_init = {.eseq = ~0ull};
-#define cache (L_->cache)
-#define cpos (L_->cpos)
-#define eseq (L_->eseq)
-#define ebi (L_->ebi)
+#define cache (Lp->cache)
+#define cpos (Lp->cpos)
+#define eseq (Lp->eseq)
+#define ebi (Lp->ebi)
 static VkDescriptorBufferInfo gsnap_info(int stage) {
     static _Thread_local struct L_gsnap_info *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); *L_ = L_gsnap_info_init; }
+    struct L_gsnap_info *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     static uint64_t maxsz, ext, t_log;
     static uint64_t n_draw, n_other, n_copy, n_bytes, n_reuse, n_skip, n_short, n_ns;
     static int dbg = -1;
@@ -8117,15 +8129,16 @@ struct L_draw_ {
     struct { uint64_t fs, hash; } memo[4096];  // (512 collided: hmix still ~0.2% of the PS4's queue thread)
     struct { uint64_t gen; Prog *pr; uint8_t cls, fb; } km;
 };
-#define pm (L_->pm)
-#define last_fs (L_->last_fs)
-#define last_hash (L_->last_hash)
-#define last_skip (L_->last_skip)
-#define memo (L_->memo)
-#define km (L_->km)
+#define pm (Lp->pm)
+#define last_fs (Lp->last_fs)
+#define last_hash (Lp->last_hash)
+#define last_skip (Lp->last_skip)
+#define memo (Lp->memo)
+#define km (Lp->km)
 static void draw_(CmdRec *r, bool indexed) {
     static _Thread_local struct L_draw_ *L_ __attribute__((tls_model("initial-exec")));
     if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
+    struct L_draw_ *const Lp = L_;  // (one TLS read a call: L_ itself would be read again after every call)
     if (profd) prof_tp_ = SDL_GetTicksNS();
     ProfZone pz0 = PZ_NOW();
     fg_before_draw();
