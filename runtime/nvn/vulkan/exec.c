@@ -11143,11 +11143,17 @@ void vk_list_stats_frame(void) {  // (device.c, each present)
     memset(&lsum, 0, sizeof lsum);
 }
 
+// A list and the lists it calls, in order: iterative, the calls on an explicit stack (where to go on after each CALL,
+// and which of its targets runs), so that a position in the frame can be written down and resumed elsewhere (the
+// translation of one frame on several threads). The calls nest at most 8 deep, as before.
+typedef struct { uint64_t ret; const uint64_t *h; uint64_t i, n; } ListFrame;
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
+    ListFrame stack[8];
+    int sp = 0;
     if (lst_on < 0) lst_on = getenv("SAVAGEWIND_VK_LIST_STATS") != NULL;
     if (lst_on) lst_begin(depth);
-    for (int guard = 0; guard < 10000000; guard++) {
+    for (int guard = 0; guard < 100000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
         // (the records were written by another core: the first touch of each one missed the cache)
@@ -11169,19 +11175,32 @@ static void exec_list(uint64_t handle, int depth) {
         default: break;
         }
         switch (r->op) {
-        case CMD_END:
+        case CMD_END: {
             if (lst_on) lst_end(depth);
-            return;
+            if (!sp) return;
+            ListFrame *f = &stack[sp - 1];  // (back in the list that called this one)
+            if (++f->i < f->n) {  // its CALL's next target
+                if (f->i + 1 < f->n) __builtin_prefetch((const void *)(uintptr_t)f->h[f->i + 1]);
+                p = f->h[f->i];
+                if (lst_on) lst_begin(depth);
+                continue;
+            }
+            p = f->ret;  // (the record after the CALL)
+            sp--, depth--;
+            continue;
+        }
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = x;
             if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS"))
                 for (uint64_t i = 0; i < r->x[0] && i < 8; i++) LOG("[call] depth %d -> %llx\n", depth, (unsigned long long)h[i]);
-            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) {
-                if (i + 1 < r->x[0]) __builtin_prefetch((const void *)(uintptr_t)h[i + 1]);  // (~2800 calls a frame)
-                exec_list(h[i], depth + 1);
-            }
-            break;
+            if (!r->x[0] || depth >= 8 || sp == 8) break;
+            if (r->x[0] > 1) __builtin_prefetch((const void *)(uintptr_t)h[1]);  // (~2800 calls a frame)
+            stack[sp++] = (ListFrame){p + r->size, h, 0, r->x[0]};
+            p = h[0];
+            depth++;
+            if (lst_on) lst_begin(depth);
+            continue;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
         case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
