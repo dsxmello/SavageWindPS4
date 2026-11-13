@@ -131,10 +131,40 @@ typedef struct Tx {
     struct { uint64_t lo, hi, serial; } uubt[UUB_MAX];  // ranges UpdateUniformBuffer wrote, with the last update's count
     int nuub;
     uint64_t uub_serial;
+    uint64_t dyn_epoch;
+    struct {
+        uint64_t epoch;
+        VkPipeline pipe;
+        VkPipelineLayout layout;
+        VkDescriptorSet sets[2];
+        uint32_t ndyn, dyn[32];  // dynamic uniform-buffer offsets bound with them
+        uint32_t dt, dw, dop, sten, cull, front, topo, restart, bias_on;
+        uint32_t sten_face[2][8];  // fail, pass, depth fail, compare, compare mask, write mask, reference
+        float blend[4], bias[3], line_w;
+        VkViewport vp;
+        VkRect2D sc;
+        VkBuffer ibuf;
+        VkDeviceSize ioff;
+        uint32_t itype;
+        VkBuffer vbuf[17];
+        VkDeviceSize voff[17];
+    } dc;
+    uint64_t key_gen;
+    uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
 } Tx;
-static Tx tx_main = {.bar_other = true, .vtx_hazard = true, .pass_sx = 1, .pass_sy = 1, .vp_sx = 1, .vp_sy = 1, .vp_ox = 0, .vp_oy = 0, .pass_samples = 1, .pass_mvec = -1, .gcopy_gen = 1};
+// Memory of a function's per-thread memos (txlocal), made on a thread's first use and kept: translating threads last.
+static void *tx_local_new(size_t n) {
+    void *p = calloc(1, n);
+    if (!p) FATAL("out of memory for a translation thread's memos (%zu bytes)\n", n);
+    return p;
+}
+static Tx tx_main = {.bar_other = true, .vtx_hazard = true, .pass_sx = 1, .pass_sy = 1, .vp_sx = 1, .vp_sy = 1, .vp_ox = 0, .vp_oy = 0, .pass_samples = 1, .pass_mvec = -1, .gcopy_gen = 1, .dyn_epoch = 1, .key_gen = 1};
 static _Thread_local Tx *g_tx __attribute__((tls_model("initial-exec"))) = &tx_main;
 #define st (g_tx->st)
+#define dyn_epoch (g_tx->dyn_epoch)
+#define dc (g_tx->dc)
+#define key_gen (g_tx->key_gen)
+#define setc_gen (g_tx->setc_gen)
 #define pass_fbl (g_tx->pass_fbl)
 #define pass_nfbl (g_tx->pass_nfbl)
 #define pass_block (g_tx->pass_block)
@@ -294,31 +324,11 @@ static uint64_t cum_draws;  // draws so far (vk_pso_wait_needed)
 // Command buffer state draw_ recorded last, so a draw records only what differs (one draw set ~20 pieces of state;
 // the open world has ~5000 draws a frame). dyn_epoch changes with each command buffer begun and wherever other code
 // binds a graphics pipeline or sets this state (vk_dyn_forget). SAVAGEWIND_VK_NO_DYN_CACHE=1: everything every draw.
-static uint64_t dyn_epoch = 1;
 static int no_dyn_cache = -1;
-static struct {
-    uint64_t epoch;
-    VkPipeline pipe;
-    VkPipelineLayout layout;
-    VkDescriptorSet sets[2];
-    uint32_t ndyn, dyn[32];  // dynamic uniform-buffer offsets bound with them
-    uint32_t dt, dw, dop, sten, cull, front, topo, restart, bias_on;
-    uint32_t sten_face[2][8];  // fail, pass, depth fail, compare, compare mask, write mask, reference
-    float blend[4], bias[3], line_w;
-    VkViewport vp;
-    VkRect2D sc;
-    VkBuffer ibuf;
-    VkDeviceSize ioff;
-    uint32_t itype;
-    VkBuffer vbuf[17];
-    VkDeviceSize voff[17];
-} dc;
 void vk_dyn_forget(void) { dyn_epoch++; }
 // Bumped by every command that changes what goes into the program and pipeline keys (exec_list) and by passes
 // (begin_pass): while it stays, a draw takes the last draw's program and pipeline without building and comparing the
 // keys (~1.4 KB a draw). SAVAGEWIND_VK_NO_KEY_GEN=1: keys every draw.
-static uint64_t key_gen = 1;
-static uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
 static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign state: nothing known
     if (dc.epoch == dyn_epoch) return;
     memset(&dc, 0xFF, sizeof dc);  // matches no value (floats: NaN)
@@ -1058,8 +1068,14 @@ void renderer_wait_seq(uint64_t seq) {
 #define ASET_CACHE 16
 #define ASET_BATCH 16
 static VkDescriptorSet vk_alloc_set_one(VkDescriptorSetLayout layout, int count, VkDescriptorSet *out);
+// vk_alloc_set's memos, one set per translating thread (txlocal)
+struct L_vk_alloc_set {
+    struct { VkDescriptorSetLayout layout; Sub *s; uint64_t seq; int pool, n, next; VkDescriptorSet set[ASET_BATCH]; } cache[ASET_CACHE];
+};
+#define cache (L_->cache)
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
-    static struct { VkDescriptorSetLayout layout; Sub *s; uint64_t seq; int pool, n, next; VkDescriptorSet set[ASET_BATCH]; } cache[ASET_CACHE];
+    static _Thread_local struct L_vk_alloc_set *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     Sub *s = sub();
     uint32_t h = (uint32_t)(((uintptr_t)layout >> 4) * 2654435761u) >> 28;  // (16 entries)
     __typeof__(cache[0]) *c = &cache[h];
@@ -1079,6 +1095,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
     c->n = 0;
     return first;
 }
+#undef cache
 
 // count sets of one layout. count > 1: filled into out[] and VK_NULL_HANDLE returned when a pool took them all in one
 // call; otherwise (single set, or the batch didn't fit) one set returned.
@@ -1204,8 +1221,14 @@ VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
 // while it's identical, within one submission. slot: one per kind of data.
 enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_GMEM, DEDUPE_SLOTS };
 // alloc: the span's size when more than the bytes compared and copied (the rest is never read)
+// copy_dedupe_in's memos, one set per translating thread (txlocal)
+struct L_copy_dedupe_in {
+    struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
+};
+#define last (L_->last)
 static VkSpan copy_dedupe_in(int slot, const void *data, uint64_t size, uint64_t alloc, uint64_t align) {
-    static struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
+    static _Thread_local struct L_copy_dedupe_in *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     uint64_t seq = vk_pending_seq();
     if (size > sizeof last[0].data) return vk_transient_copy(data, size, align);
     if (last[slot].seq == seq && last[slot].size == size && !memcmp(last[slot].data, data, size)) return last[slot].span;
@@ -1214,6 +1237,7 @@ static VkSpan copy_dedupe_in(int slot, const void *data, uint64_t size, uint64_t
     last[slot].seq = seq; last[slot].size = size; memcpy(last[slot].data, data, size); last[slot].span = s;
     return s;
 }
+#undef last
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
     return copy_dedupe_in(slot, data, size, 0, align);
 }
@@ -2626,10 +2650,16 @@ static VkRect2D scissor_rect(void) {
     return (VkRect2D){{x, y}, {(uint32_t)sw, (uint32_t)sh}};
 }
 
+// apply_scissor's memos, one set per translating thread (txlocal)
+struct L_apply_scissor {
+    struct { const void *c, *d; uint32_t w, h; float s[6]; int32_t sc[4]; VkRect2D r; bool ok; } m;
+};
+#define m (L_->m)
 static void apply_scissor(void) {
+    static _Thread_local struct L_apply_scissor *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     // (passes outside the final image: the rectangle depends on nothing else than these, the same for most of a pass's
     // draws; scissor_rect was ~2 % of the render thread)
-    static struct { const void *c, *d; uint32_t w, h; float s[6]; int32_t sc[4]; VkRect2D r; bool ok; } m;
     VkRect2D r;
     const float s6[6] = {pass_sx, pass_sy, vp_sx, vp_sy, vp_ox, vp_oy};
     if (!pass_out && m.ok && m.c == st.rt.color[0] && m.d == st.rt.depth && m.w == pass_w && m.h == pass_h &&
@@ -2647,6 +2677,7 @@ static void apply_scissor(void) {
     rec_CmdSetScissor(vk_cmd(), 0, 1, &r);
     dc.sc = r;
 }
+#undef m
 
 // Metal convention (y up in NDC, origin top-left) through a negative-height viewport.
 static void set_viewport(float x, float y, float w, float h, float zn, float zf) {
@@ -3272,7 +3303,13 @@ static void prog_tab_grow(void) {
 // The last program and pipeline draw_ looked up (consecutive draws mostly repeat them; cleared by vk_exec_reset). Two
 // programs: the game's, and their motion vector variants (a draw of a motion pass looks up both; one memo for both
 // missed every time).
-static struct { uint64_t code[2]; ShaderKey vk; uint8_t rt[sizeof ((ShaderKey *)0)->rt_kind], mvec_rt; Prog *p; } prog_memo[2];
+// The program lookup's memo (translation context, see Tx)
+typedef struct TxProg {
+    struct { uint64_t code[2]; ShaderKey vk; uint8_t rt[sizeof ((ShaderKey *)0)->rt_kind], mvec_rt; Prog *p; } prog_memo[2];
+} TxProg;
+static TxProg txprog_main;
+static _Thread_local TxProg *g_txprog __attribute__((tls_model("initial-exec"))) = &txprog_main;
+#define prog_memo (g_txprog->prog_memo)
 
 static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
@@ -3591,7 +3628,13 @@ static void pipe_tab_grow(void) {
     pipe_tab = nt;
     pipe_cap = cap;
 }
-static struct { PipeKey k; Pipe *pp; } pipe_memo;  // (see prog_memo)
+// The pipeline lookup's memo (translation context, see Tx)
+typedef struct TxPipe {
+    struct { PipeKey k; Pipe *pp; } pipe_memo;  // (see prog_memo)
+} TxPipe;
+static TxPipe txpipe_main;
+static _Thread_local TxPipe *g_txpipe __attribute__((tls_model("initial-exec"))) = &txpipe_main;
+#define pipe_memo (g_txpipe->pipe_memo)
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
 // stored constants (fragment-shader hashes) and must not change.
@@ -4671,8 +4714,16 @@ static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
 // texels of the bigger map: the penumbra breaks into steps. In draws that sample such a map, that pair in the
 // fragment stage's constant buffers becomes the map's own texel size (1/2048, 1/4096): the same filter, finer.
 
+// sdw_patch's memos, one set per translating thread (txlocal)
+struct L_sdw_patch {
+    struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float s; bool found; VkDescriptorBufferInfo d; } memo[8];
+    float buf[0x10000 / 4];
+};
+#define memo (L_->memo)
+#define buf (L_->buf)
 static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
-    static struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float s; bool found; VkDescriptorBufferInfo d; } memo[8];
+    static _Thread_local struct L_sdw_patch *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
     if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
@@ -4687,7 +4738,6 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     if (off && renderer_present_count() + 1 >= (uint64_t)off) return false;
     const float *g = (const float *)(uintptr_t)addr;
     float tx = 1.0f / (float)sdw_fix.gw, ty = 1.0f / (float)sdw_fix.gh;
-    static float buf[0x10000 / 4];
     static int nlog;
     uint64_t nw = size / 4;
     for (uint64_t i = 0; i + 1 < nw; i += 2) {  // (a vec2: 8-byte aligned)
@@ -4706,6 +4756,8 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     if (m->found) m->d = *out = ubo_span(vk_transient_copy(buf, size, 256), size);
     return m->found;
 }
+#undef memo
+#undef buf
 
 // BOTW's half-size passes on a scaled scene: the draws that bring its half-size buffers (lighting, the sun's shadow
 // mask, the clouds) back to the full image pick, per pixel, the half-size texel whose depth is nearest (the deferred
@@ -4721,8 +4773,16 @@ static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
 // fragment constant pair (1/w, 1/h) of the gathered texture's size becomes its allocated texel: the same choice in the
 // scaled image's texels. At the game's own size nothing changes. SAVAGEWIND_NO_UPSAMPLE_FIX=1: as before.
 
+// up_patch's memos, one set per translating thread (txlocal)
+struct L_up_patch {
+    struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float sx, sy; bool found; VkDescriptorBufferInfo d; } memo[8];
+    float buf[0x10000 / 4];
+};
+#define memo (L_->memo)
+#define buf (L_->buf)
 static bool up_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
-    static struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float sx, sy; bool found; VkDescriptorBufferInfo d; } memo[8];
+    static _Thread_local struct L_up_patch *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
     if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
@@ -4733,7 +4793,6 @@ static bool up_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) 
     *m = (__typeof__(*m)){.addr = addr, .size = size, .gen = gen, .serial = uub_serial, .seq = seq, .gw = up_fix.gw,
                           .gh = up_fix.gh, .sx = up_fix.sx, .sy = up_fix.sy};
     const float *g = (const float *)(uintptr_t)addr;
-    static float buf[0x10000 / 4];
     static int nlog;
     uint64_t nw = (size < sizeof buf ? size : sizeof buf) / 4;
     for (uint64_t i = 0; i + 3 < nw; i += 4) {  // (a vec4: 16-byte aligned)
@@ -4759,9 +4818,19 @@ static bool up_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) 
     if (m->found) m->d = *out = ubo_span(vk_transient_copy(buf, nw * 4, 256), nw * 4);
     return m->found;
 }
+#undef memo
+#undef buf
 
+// up_patch_frag's memos, one set per translating thread (txlocal)
+struct L_up_patch_frag {
+    struct { uint64_t addr, size, gen, serial, seq; uint32_t tw, th, aw, ah; bool found; VkDescriptorBufferInfo d; } memo[8];
+    float buf[0x10000 / 4];
+};
+#define memo (L_->memo)
+#define buf (L_->buf)
 static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
-    static struct { uint64_t addr, size, gen, serial, seq; uint32_t tw, th, aw, ah; bool found; VkDescriptorBufferInfo d; } memo[8];
+    static _Thread_local struct L_up_patch_frag *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
     uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
     if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
@@ -4774,7 +4843,6 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
     if (!up_fix.tw || !up_fix.th || (up_fix.tw == up_fix.aw && up_fix.th == up_fix.ah)) return false;
     const float *g = (const float *)(uintptr_t)addr;
     float tx = 1.0f / (float)up_fix.tw, ty = 1.0f / (float)up_fix.th;
-    static float buf[0x10000 / 4];
     static int nlog;
     uint64_t nw = (size < sizeof buf ? size : sizeof buf) / 4;
     for (uint64_t i = 0; i + 1 < nw; i += 2) {  // (a vec2: 8-byte aligned)
@@ -4792,6 +4860,8 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
     if (m->found) m->d = *out = ubo_span(vk_transient_copy(buf, nw * 4, 256), nw * 4);
     return m->found;
 }
+#undef memo
+#undef buf
 
 // The views widened to the window (output_scale.c rt_persp), in draws into the final image (RS_OUT) whose vertex
 // constant buffer c3 starts with a symmetric perspective matrix (the HUD's and menus' layers: nn::ui2d's vertex block,
@@ -4837,7 +4907,14 @@ static bool hud_frame_end(const float *g, const float *mv, const float *rc, floa
     return end;
 }
 
+// hud_patch's memos, one set per translating thread (txlocal)
+struct L_hud_patch {
+    float buf[0x10000 / 4];
+};
+#define buf (L_->buf)
 static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    static _Thread_local struct L_hud_patch *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
     extern float output_view_shape(void);
@@ -4871,7 +4948,6 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     // so it stays in the 16:9 layout with the rest of the HUD instead of moving outwards with the wider view.
     if (g[0] > 0 && g[5] != 0 && g[14] == -1 && !g[1] && !g[2] && !g[4] && !g[6] && !g[8] && !g[9] && !g[12] && !g[13] &&
         (g[3] || g[7]) && g[15] > 0 && fabsf(fabsf(g[5]) / g[0] - 16.0f / 9.0f) < 0.002f) {
-        static float buf[0x10000 / 4];
         uint64_t n = size > sizeof buf ? sizeof buf : size;
         memcpy(buf, g, n);
         if (shape > 1) buf[0] /= shape, buf[3] /= shape;
@@ -4896,7 +4972,6 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     // (The same shader's whole-screen quads, scale 2, are left as they are.)
     if (shape > 1 && size >= 64 && framepace_map_ui() && g[4] > 0 && g[4] < 1 && !g[5] && !g[6] && !g[8] && g[9] > 0 &&
         g[9] < 1 && !g[10] && !g[12] && !g[13] && !g[14] && g[15] == -1) {
-        static float buf[0x10000 / 4];
         uint64_t n = size > sizeof buf ? sizeof buf : size;
         memcpy(buf, g, n);
         buf[4] /= shape, buf[7] /= shape;
@@ -4974,7 +5049,6 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
         }
     }
     if (m00 == g[0] && m11 == g[5] && !hud_scale && edge_dy == 0) return false;
-    static float buf[0x10000 / 4];
     uint64_t n = size > sizeof buf ? sizeof buf : size;
     memcpy(buf, g, n);
     buf[0] = m00, buf[5] = m11;
@@ -4983,6 +5057,7 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     *out = ubo_span(vk_transient_copy(buf, n, 256), n);
     return true;
 }
+#undef buf
 
 // Video > Game's FXAA off. BOTW's FXAA (3.11, console) is its scene -> final image composite shader (scene_composite):
 // four diagonal luma taps around the centre, then two or four along the edge. It filters only where the local luma
@@ -4995,15 +5070,22 @@ static bool fxaa_shader(uint64_t fs_hash) {
         || fs_hash == 0x0a849327680eee9full; // the pause menu: quality FXAA
 }
 static bool fxaa_off;  // (the draw in progress)
+// fxaa_patch's memos, one set per translating thread (txlocal)
+struct L_fxaa_patch {
+    float buf[0x10000 / 4];
+};
+#define buf (L_->buf)
 static bool fxaa_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    static _Thread_local struct L_fxaa_patch *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     if (size < 0x40) return false;
-    static float buf[0x10000 / 4];
     uint64_t n = size > sizeof buf ? sizeof buf : size;
     memcpy(buf, (const void *)(uintptr_t)addr, n);
     buf[0x30 / 4] = buf[0x34 / 4] = 1e30f;
     *out = ubo_span(vk_transient_copy(buf, n, 256), n);
     return true;
 }
+#undef buf
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -5817,9 +5899,15 @@ static int gw_find(uint64_t addr) {  // the first range ending after addr
 // range, until the set changes (gw_gen). The search was 3% of the render thread's time (4 cores, Rito).
 // SAVAGEWIND_VK_NO_GW_MEMO=1: search every time.
 static uint32_t gw_gen = 1;
+// gw_overlaps's memos, one set per translating thread (txlocal)
+struct L_gw_overlaps {
+    struct { uint64_t lo, hi; uint32_t gen; bool r; } memo[1024];
+};
+#define memo (L_->memo)
 static bool gw_overlaps(uint64_t lo, uint64_t hi) {
+    static _Thread_local struct L_gw_overlaps *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     if (!ngw || hi <= gw_lo || lo >= gw_hi) return false;
-    static struct { uint64_t lo, hi; uint32_t gen; bool r; } memo[1024];
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_VK_NO_GW_MEMO") == NULL;
     uint32_t k = (uint32_t)(((lo >> 6) ^ (hi >> 4)) * 0x9E3779B1u) >> 22;
@@ -5829,6 +5917,7 @@ static bool gw_overlaps(uint64_t lo, uint64_t hi) {
     memo[k].lo = lo, memo[k].hi = hi, memo[k].gen = gw_gen, memo[k].r = r;
     return r;
 }
+#undef memo
 
 static bool gw_add(uint64_t lo, uint64_t hi) {  // false: no room
     int i = gw_find(lo);
@@ -6561,7 +6650,14 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
 // render thread at Rito). Not for depth-compare textures (their shadow copies and depth twins come and go within a
 // frame), nor while this draw has feedback copies or a scene composite in play; a view that may have been destroyed
 // bumps vk_view_gen, which drops them all. SAVAGEWIND_VK_NO_TEX_MEMO=1: off, with the view memo.
+// texture_info's memos, one set per translating thread (txlocal)
+struct L_texture_info {
+    struct { uint64_t h, frame; const void *tpool, *spool, *tex; NvnTextureView view; uint8_t has_view; uint32_t gen; uint8_t type, stage, blend, valid; float bias, sc[2]; uint32_t wh[2]; VkDescriptorImageInfo ii; } m[2048];
+};
+#define m (L_->m)
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
+    static _Thread_local struct L_texture_info *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
@@ -6576,17 +6672,6 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
         texture_info_(stage, si, i, out, sc, wh);
         return;
     }
-    static struct {
-        uint64_t h, frame;
-        const void *tpool, *spool, *tex;
-        NvnTextureView view;
-        uint8_t has_view;
-        uint32_t gen;
-        uint8_t type, stage, blend, valid;
-        float bias, sc[2];
-        uint32_t wh[2];
-        VkDescriptorImageInfo ii;
-    } m[2048];
     uint8_t blend = st.color_state[0] & 1;
     float bias = stage == 1 && pass_mvec >= 0 && rt_jitter_on() ? scene_mip_bias : 0;  // (the material bias, if it is one)
     uint64_t frame = vk_frame_counter();
@@ -6605,8 +6690,16 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                           .stage = (uint8_t)stage, .blend = blend, .valid = 1, .bias = bias, .sc = {sc[0], sc[1]},
                           .wh = {wh[0], wh[1]}, .ii = *out};
 }
+#undef m
 
+// texture_info_'s memos, one set per translating thread (txlocal)
+struct L_texture_info_ {
+    struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
+};
+#define memo (L_->memo)
 static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
+    static _Thread_local struct L_texture_info_ *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
@@ -6631,7 +6724,6 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
             extern uint64_t vk_frame_counter(void);
             static int nomemo = -1;
             if (nomemo < 0) nomemo = getenv("SAVAGEWIND_VK_NO_TEX_MEMO") != NULL;
-            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
             uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
             uint32_t ms = (uint32_t)((((uintptr_t)et >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
             if (!nomemo && memo[ms].tex == et && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
@@ -6689,6 +6781,7 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, layout};
 }
+#undef memo
 
 // Descriptor sets of identical contents within one submission are one set (the open world draws many objects with
 // the same material textures and constants): saves the allocation and the update. SAVAGEWIND_VK_NO_SET_CACHE=1: off.
@@ -6696,13 +6789,20 @@ static void texture_info_(int stage, ShaderInfo *si, int i, VkDescriptorImageInf
 // from a 3 MB table cost more than the hashing).
 #define SETC_TAB 4096
 typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
-static SetEnt *setc;
+#define SETL_SLOTS 16  // (set_finish: the last set of each layout, by slot)
+// The descriptor sets the draws share (translation context, see Tx)
+typedef struct TxSets {
+    SetEnt *setc;
+    struct { VkDescriptorSetLayout layout; uint64_t seq; uint32_t n; VkDescriptorSet set; uint64_t key[MAX_BIND][4]; } setl[SETL_SLOTS];
+} TxSets;
+static TxSets txsets_main;
+static _Thread_local TxSets *g_txsets __attribute__((tls_model("initial-exec"))) = &txsets_main;
+#define setc (g_txsets->setc)
+#define setl (g_txsets->setl)
 
 // Before the table: the last set of each layout (by a few slots), kept with its writes. ~85% of the draws in BOTW's
 // open world bind the same set for a stage as the draw before (only their dynamic offsets change), and comparing
-// ~700 hot bytes costs less than the two hashes and the probe (~5% of the PS4's queue thread).
-#define SETL_SLOTS 16
-static struct { VkDescriptorSetLayout layout; uint64_t seq; uint32_t n; VkDescriptorSet set; uint64_t key[MAX_BIND][4]; } setl[SETL_SLOTS];
+// ~700 hot bytes costs less than the two hashes and the probe (~5% of the PS4's queue thread). (setl: TxSets, above)
 
 static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n) {
     static int off = -1;
@@ -6894,9 +6994,21 @@ static bool gsnap_linear_hit(Range r) {  // (render targets also written into th
 // didn't. (Where that reaches GPU data, the bound size only.) In every pass; SAVAGEWIND_VK_GSNAP=1: passes into the
 // final image only. SAVAGEWIND_VK_GSNAP_EXT=<KB>: the bytes after (16).
 #define GSNAP_N 4
+// gsnap_info's memos, one set per translating thread (txlocal)
+struct L_gsnap_info {
+    struct { uint64_t seq; int n; Range r[GSNAP_N]; VkDescriptorBufferInfo bi; } cache[32];
+    int cpos;
+    uint64_t eseq;
+    VkDescriptorBufferInfo ebi;
+};
+static const struct L_gsnap_info L_gsnap_info_init = {.eseq = ~0ull};
+#define cache (L_->cache)
+#define cpos (L_->cpos)
+#define eseq (L_->eseq)
+#define ebi (L_->ebi)
 static VkDescriptorBufferInfo gsnap_info(int stage) {
-    static struct { uint64_t seq; int n; Range r[GSNAP_N]; VkDescriptorBufferInfo bi; } cache[32];
-    static int cpos;
+    static _Thread_local struct L_gsnap_info *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); *L_ = L_gsnap_info_init; }
     static uint64_t maxsz, ext, t_log;
     static uint64_t n_draw, n_other, n_copy, n_bytes, n_reuse, n_skip, n_short, n_ns;
     static int dbg = -1;
@@ -6910,8 +7022,6 @@ static VkDescriptorBufferInfo gsnap_info(int stage) {
     bool here = m && (m == 2 || pass_out) && (stage == 0 || stage == 1) && gmem_size;
     if (!here) {  // (no copies here: one empty table per submission, the shader looks at none of it)
         if (m && (stage == 0 || stage == 1)) n_other++;
-        static uint64_t eseq = ~0ull;
-        static VkDescriptorBufferInfo ebi;
         uint64_t sq = vk_pending_seq();
         if (eseq != sq) {
             VkSpan e = vk_transient(GSNAP_N * 16 + 16, 256);
@@ -6990,6 +7100,10 @@ static VkDescriptorBufferInfo gsnap_info(int stage) {
     }
     return bi;
 }
+#undef cache
+#undef cpos
+#undef eseq
+#undef ebi
 
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
@@ -7995,14 +8109,29 @@ static void wait_built(_Atomic int *state) {  // (0 building: until built or fai
     perfcount_add(PC_BUILD_WAIT_NS, SDL_GetTicksNS() - t0);
 }
 
+// draw_'s memos, one set per translating thread (txlocal)
+struct L_draw_ {
+    struct { uint64_t gen; uint32_t origin, dmode; NvnProgram *np; Prog *pr; bool points; } pm;
+    uint64_t last_fs, last_hash;
+    bool last_skip;
+    struct { uint64_t fs, hash; } memo[4096];  // (512 collided: hmix still ~0.2% of the PS4's queue thread)
+    struct { uint64_t gen; Prog *pr; uint8_t cls, fb; } km;
+};
+#define pm (L_->pm)
+#define last_fs (L_->last_fs)
+#define last_hash (L_->last_hash)
+#define last_skip (L_->last_skip)
+#define memo (L_->memo)
+#define km (L_->km)
 static void draw_(CmdRec *r, bool indexed) {
+    static _Thread_local struct L_draw_ *L_ __attribute__((tls_model("initial-exec")));
+    if (__builtin_expect(!L_, 0)) { L_ = tx_local_new(sizeof *L_); }
     if (profd) prof_tp_ = SDL_GetTicksNS();
     ProfZone pz0 = PZ_NOW();
     fg_before_draw();
     if (!st.program) { stat_skipped++; return; }
     static int no_key_gen = -1;
     if (no_key_gen < 0) no_key_gen = getenv("SAVAGEWIND_VK_NO_KEY_GEN") != NULL;
-    static struct { uint64_t gen; uint32_t origin, dmode; NvnProgram *np; Prog *pr; bool points; } pm;
     uint32_t origin = nvn_window_origin(), dmode = nvn_depth_mode();
     Prog *pr;
     bool vkey_flip = origin == 0;
@@ -8030,8 +8159,6 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     //if (profd) prof_program += SDL_GetTicksNS() - prof_program_start;
     {   // fragment-shader hash: skip lists (SAVAGEWIND_SKIP_FSHASH), debug logs, GPU profile labels
-        static uint64_t last_fs, last_hash;
-        static bool last_skip;
         static FsSel skip[16];
         static int nskip = -1;
         if (nskip < 0) nskip = fs_sel_parse(getenv("SAVAGEWIND_SKIP_FSHASH"), skip, 16);
@@ -8040,7 +8167,6 @@ static void draw_(CmdRec *r, bool indexed) {
             last_fs = fs;
             // (by code address, like the program table: 512 bytes hashed byte by byte at every fragment shader change
             // cost 1% of the translation)
-            static struct { uint64_t fs, hash; } memo[4096];  // (512 collided: hmix still ~0.2% of the PS4's queue thread)
             uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 52);  // (code addresses are 256-aligned)
             if (fs && memo[ms].fs == fs) last_hash = memo[ms].hash;
             else {
@@ -8325,7 +8451,6 @@ static void draw_(CmdRec *r, bool indexed) {
     ProfZone pz1 = PZ_NOW();
     PZ_SPAN("exec/draw/pre", pz0, pz1);
     // ---- pipeline
-    static struct { uint64_t gen; Prog *pr; uint8_t cls, fb; } km;
     Pipe *pp;
     if (!no_key_gen && pipe_memo.pp && km.gen == key_gen && km.pr == pr && km.cls == cls && km.fb == draw_feedback) {
         pp = pipe_memo.pp;
@@ -8841,6 +8966,12 @@ have_pipe:
         if (g->started && g->n && g->gen == prof_generation() && prof_enabled()) g->draws[g->n - 1]++;
     }
 }
+#undef pm
+#undef last_fs
+#undef last_hash
+#undef last_skip
+#undef memo
+#undef km
 
 static void debug_save_channels(TexBackend *b, const char *path);
 
